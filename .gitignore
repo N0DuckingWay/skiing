@@ -1,0 +1,12 @@
+*.osm.pbf
+*.osm
+*.osm
+*.p
+
+# OSM data pipeline: downloads and results are multi-GB, never commit them
+osm_data/data/
+*.idx
+__pycache__/
+
+# Credentials: never commit them
+proxyinfo.txt
