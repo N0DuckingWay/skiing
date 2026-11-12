@@ -1,0 +1,76 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+    paths-ignore:
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/claude-code-review.yml"
+    # Optional: Only run on specific file changes
+    # paths:
+    #   - "src/**/*.ts"
+    #   - "src/**/*.tsx"
+    #   - "src/**/*.js"
+    #   - "src/**/*.jsx"
+
+jobs:
+  # Same rule as the size gate in ci.yml: a PR is reviewed only when it changes
+  # more than one file or more than 50 lines (additions + deletions). Keep the
+  # two in step.
+  gate:
+    name: Size gate
+    runs-on: ubuntu-latest
+    outputs:
+      run_review: ${{ steps.decide.outputs.run_review }}
+    steps:
+      - id: decide
+        env:
+          FILES: ${{ github.event.pull_request.changed_files }}
+          ADDITIONS: ${{ github.event.pull_request.additions }}
+          DELETIONS: ${{ github.event.pull_request.deletions }}
+        run: |
+          LINES=$((ADDITIONS + DELETIONS))
+          echo "PR changes $FILES file(s) and $LINES line(s)"
+          if [ "$FILES" -gt 1 ] || [ "$LINES" -gt 50 ]; then
+            echo "run_review=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_review=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  claude-review:
+    needs: gate
+    if: needs.gate.outputs.run_review == 'true'
+    # Optional: Filter by PR author
+    # if: |
+    #   github.event.pull_request.user.login == 'external-contributor' ||
+    #   github.event.pull_request.user.login == 'new-developer' ||
+    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # PRs that Claude itself opens or pushes to are started by the "claude" bot;
+          # without this the action refuses to run for a non-human actor.
+          allowed_bots: 'claude'
+          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
+          plugins: 'code-review@claude-code-plugins'
+          prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
+          claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment"'
+          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
+          # or https://code.claude.com/docs/en/cli-reference for available options
+
