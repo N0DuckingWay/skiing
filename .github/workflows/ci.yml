@@ -21,6 +21,7 @@ jobs:
     name: Size gate
     runs-on: ubuntu-latest
     permissions:
+      contents: read # needed to read PR files and commits on a private repo
       pull-requests: read
     outputs:
       # verify only runs for a suspected pull of dev and, when it does, has
