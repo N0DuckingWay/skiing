@@ -38,7 +38,6 @@ import hashlib
 import json
 import math
 import re
-import sqlite3
 import subprocess
 import sys
 import time
@@ -55,6 +54,7 @@ from shapely.errors import GEOSException
 from common import (
     DEFAULT_DATA_DIR,
     OSMCONF,
+    fid_range,
     finish,
     human_size,
     log,
@@ -266,11 +266,6 @@ def osm_to_gpkg(src: Path, dst: Path, tmpdir: Path, where: str | None = None) ->
     if where:
         cmd += ["-where", where]
     run(cmd)
-
-
-def fid_range(gpkg: Path, layer: str) -> tuple[int | None, int | None]:
-    with sqlite3.connect(gpkg) as con:
-        return con.execute(f'SELECT MIN(fid), MAX(fid) FROM "{layer}"').fetchone()
 
 
 # ---------------------------------------------------------------- steps
