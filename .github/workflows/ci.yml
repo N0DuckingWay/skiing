@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+
+jobs:
+  # Pushes to dev always run CI. A PR runs it only when it changes more than
+  # one file or more than 50 lines (additions + deletions); the numbers come
+  # straight from the pull_request event payload, so no checkout is needed.
+  # A PR whose newest commit is a clean pull of dev into the branch (a merge
+  # commit titled "Merge branch 'dev' into ...", which is what GitHub's
+  # "Update branch" button and `git merge dev` write) skips CI too: dev
+  # already passed it, and the branch's own changes were tested on earlier
+  # pushes. A PR that changes only this file and claude-code-review.yml skips CI as well
+  # (the workflow still starts, so the required Lint and Test checks report
+  # "skipped" instead of staying "expected"). "Clean" means replaying the merge gives the same files as the
+  # commit; conflict fixes or extra edits inside it still run CI.
+  gate:
+    name: Size gate
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      # verify only runs for a suspected pull of dev and, when it does, has
+      # the last word; otherwise the first step's answer stands.
+      run_ci: ${{ steps.verify.outputs.run_ci || steps.decide.outputs.run_ci }}
+    steps:
+      - id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          FILES: ${{ github.event.pull_request.changed_files }}
+          ADDITIONS: ${{ github.event.pull_request.additions }}
+          DELETIONS: ${{ github.event.pull_request.deletions }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "run_ci=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A PR that touches nothing but the CI/review workflow files has no code to test.
+          OTHER=$(gh api --paginate "repos/$GH_REPO/pulls/$PR_NUMBER/files" --jq '.[].filename' | grep -vxF -e '.github/workflows/ci.yml' -e '.github/workflows/claude-code-review.yml' || true)
+          if [ -z "$OTHER" ]; then
+            echo "PR only changes the CI/review workflows; skipping CI"
+            echo "run_ci=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Two parents plus a "Merge branch 'dev'" (or remote-tracking
+          # 'origin/dev') title marks a pull of dev into this branch.
+          PARENTS=$(gh api "repos/$GH_REPO/commits/$HEAD_SHA" --jq '.parents | length')
+          TITLE=$(gh api "repos/$GH_REPO/commits/$HEAD_SHA" --jq '.commit.message | split("\n")[0]')
+          echo "Head commit has $PARENTS parent(s): $TITLE"
+          if [ "$PARENTS" -ge 2 ] && echo "$TITLE" | grep -Eq "^Merge (remote-tracking )?branch '(origin/)?dev'"; then
+            # Looks like a pull of dev; the next steps replay it to see if it
+            # was clean. Until they say so, CI runs.
+            echo "main_pull=true" >> "$GITHUB_OUTPUT"
+            echo "run_ci=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          LINES=$((ADDITIONS + DELETIONS))
+          echo "PR changes $FILES file(s) and $LINES line(s)"
+          if [ "$FILES" -gt 1 ] || [ "$LINES" -gt 50 ]; then
+            echo "run_ci=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_ci=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Only for a commit that looks like a pull of dev: replay the merge and
+      # compare. The full history is needed so both parents are available.
+      - if: steps.decide.outputs.main_pull == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - id: verify
+        if: steps.decide.outputs.main_pull == 'true'
+        run: |
+          git config user.name ci
+          git config user.email ci@example.invalid
+          git checkout --detach "$HEAD_SHA^1"
+          # A merge git completes by itself, with no conflicts, is a clean one.
+          # Its tree must equal the pushed commit's; any difference means the
+          # author resolved conflicts or changed code inside the merge.
+          if git merge --no-commit --no-ff "$HEAD_SHA^2" >/dev/null 2>&1 \
+             && [ "$(git write-tree)" = "$(git rev-parse "$HEAD_SHA^{tree}")" ]; then
+            echo "Clean pull of dev; skipping CI"
+            echo "run_ci=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Merge had conflicts or extra changes; running CI"
+            echo "run_ci=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+  # Only the OSM scripts in osm_data/ are Python code here. The rule set is
+  # pinned (syntax errors, import placement, pyflakes) so a newer ruff release
+  # cannot start failing CI on its own default rules.
+  lint:
+    name: Lint (ruff)
+    needs: gate
+    if: needs.gate.outputs.run_ci == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Install ruff
+        run: pip install ruff
+      - name: Run ruff
+        run: python3 -m ruff check --isolated --select E4,E9,F osm_data/
+
+  # There is no pytest suite yet, so this job only checks that every script
+  # compiles. Swap it for pytest once tests exist.
+  test:
+    name: Test (compile check)
+    needs: gate
+    if: needs.gate.outputs.run_ci == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Compile scripts
+        run: python3 -m compileall -q osm_data
