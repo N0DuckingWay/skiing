@@ -115,7 +115,7 @@ Project copy of GDAL's OSM config: more closed-way polygon keys, ski and land-co
 - No test suite yet; `check_outputs.py` is the validation tool.
 
 ## CI and GitHub
-- Default branch: `dev`. `ci.yml` runs on pushes to `dev` and on PRs, with a size gate (PRs touching one file and 50 or fewer changed lines, clean merges of `dev`, and workflow-only PRs skip).
+- Default branch on GitHub (`N0DuckingWay/skiing`): `main`; open PRs against it. There is no `dev` branch on the remote, yet `ci.yml` still triggers on pushes to `dev` (so it only runs on PRs until that is changed). `ci.yml` runs on PRs, with a size gate (PRs touching one file and 50 or fewer changed lines, clean merges of `dev`, and workflow-only PRs skip).
   - Lint: `ruff check --isolated --select E4,E9,F osm_data/` (syntax errors, import placement, pyflakes). Run the same locally before pushing.
   - Test: only `python -m compileall -q osm_data` until a pytest suite exists.
 - `claude.yml`: responds to `@claude` mentions on issues and PRs. `claude-code-review.yml`: automated PR review.
