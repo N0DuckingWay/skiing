@@ -44,7 +44,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import sqlite3
 import subprocess
 import sys
 import time
@@ -53,10 +52,12 @@ from pathlib import Path
 
 from common import (
     DEFAULT_DATA_DIR,
+    connect_ro,
     finish,
     human_size,
     log,
     now_iso,
+    polygonal,
     read_json,
     require_tools,
     setup_logging,
@@ -315,10 +316,6 @@ def forests_to_cut_where(L: Layer) -> str:
 
 # ---------------------------------------------------------------- reading the input
 
-def connect_ro(gpkg: Path) -> sqlite3.Connection:
-    return sqlite3.connect(gpkg.resolve().as_uri() + "?mode=ro", uri=True)
-
-
 def read_layers(gpkg: Path) -> list[Layer]:
     with connect_ro(gpkg) as con:
         names = [r[0] for r in con.execute(
@@ -353,20 +350,6 @@ def print_report(counts: dict) -> None:
 
 
 # ---------------------------------------------------------------- clearcuts
-
-def polygonal(geom):
-    """The polygon parts of `geom` as a MultiPolygon, or None if it has none."""
-    import shapely
-
-    parts, todo = [], list(shapely.get_parts(geom))
-    while todo:
-        g = todo.pop()
-        if g.geom_type == "Polygon" and not g.is_empty:
-            parts.append(g)
-        elif g.geom_type in ("MultiPolygon", "GeometryCollection"):
-            todo.extend(shapely.get_parts(g))
-    return shapely.MultiPolygon(parts) if parts else None
-
 
 def cut_clearcuts(src: Path, L: Layer):
     """Cut clearcut shapes out of the kept forest polygons that overlap them.

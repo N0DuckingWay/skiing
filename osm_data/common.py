@@ -1,4 +1,4 @@
-"""Helpers shared by download_osm.py and filter_near_runs.py."""
+"""Helpers shared by the osm_data scripts."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 import logging
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -83,6 +84,30 @@ def write_json(path: Path, data: dict) -> None:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def connect_ro(gpkg: Path) -> sqlite3.Connection:
+    """Open a GeoPackage read-only with plain sqlite3."""
+    return sqlite3.connect(gpkg.resolve().as_uri() + "?mode=ro", uri=True)
+
+
+def fid_range(gpkg: Path, layer: str) -> tuple[int | None, int | None]:
+    with connect_ro(gpkg) as con:
+        return con.execute(f'SELECT MIN(fid), MAX(fid) FROM "{layer}"').fetchone()
+
+
+def polygonal(geom):
+    """The polygon parts of `geom` as a MultiPolygon, or None if it has none."""
+    import shapely
+
+    parts, todo = [], list(shapely.get_parts(geom))
+    while todo:
+        g = todo.pop()
+        if g.geom_type == "Polygon" and not g.is_empty:
+            parts.append(g)
+        elif g.geom_type in ("MultiPolygon", "GeometryCollection"):
+            todo.extend(shapely.get_parts(g))
+    return shapely.MultiPolygon(parts) if parts else None
 
 
 def human_size(n: float) -> str:
