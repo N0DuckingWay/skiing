@@ -8,7 +8,7 @@ Two scripts turn free OpenStreetMap data for the US and Canada into:
 These are already in the `coding-projects` conda env:
 - **osmium-tool:** command-line tool for filtering raw OSM files (`brew install osmium-tool`).
 - **GDAL:** converts map file formats; its `ogr2ogr` command writes the GeoPackage layers.
-- **Python packages:** geopandas, shapely, pyogrio; `merge_features.py` also uses pyosmium and scipy, and its tests use pytest.
+- **Python packages:** geopandas, shapely, pyogrio; `merge_features.py` also uses pyosmium, scipy and rapidfuzz, and its tests use pytest.
 
 ## Run it
 Keep the data in the main checkout, not in a git worktree, so it survives worktree cleanup:

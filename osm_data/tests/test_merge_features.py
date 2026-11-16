@@ -69,10 +69,11 @@ def test_names_clearly_different(a, b):
     assert match(a, b)[0] is None
 
 
-def test_osa_distance():
-    assert mf.osa_distance("abcd", "abdc", 3) == 1          # adjacent swap counts once
-    assert mf.osa_distance("kitten", "sitting", 5) == 3
-    assert mf.osa_distance("a", "abcdef", 2) == 3            # capped at limit + 1
+def test_swapped_letters_count_as_one_edit():
+    # OSA distance counts two swapped neighbouring letters as one edit. Plain
+    # Levenshtein would count two and keep these names apart.
+    assert match("Bear Claw", "Baer Claw")[0] == "fuzzy"
+    assert match("White Lightning", "White Lihgtning")[0] == "fuzzy"
 
 
 # ---------------------------------------------------------------- attributes

@@ -65,6 +65,7 @@ import osmium
 import pandas as pd
 import pyogrio
 import shapely
+from rapidfuzz.distance import OSA
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
@@ -196,37 +197,36 @@ def allowed_edits(length: int) -> int:
     return 2 if length >= 16 else 1 if length >= 8 else 0
 
 
-def osa_distance(a: str, b: str, limit: int) -> int:
-    """Edit distance with adjacent swaps (optimal string alignment), capped at limit + 1."""
-    if abs(len(a) - len(b)) > limit:
-        return limit + 1
-    prev2: list[int] = []
-    prev = list(range(len(b) + 1))
-    for i in range(1, len(a) + 1):
-        cur = [i] + [0] * len(b)
-        for j in range(1, len(b) + 1):
-            v = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] != b[j - 1]))
-            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
-                v = min(v, prev2[j - 2] + 1)
-            cur[j] = v
-        if min(cur) > limit:
-            return limit + 1
-        prev2, prev = prev, cur
-    return min(prev[-1], limit + 1)
-
-
 def compare_names(a: NameKey, b: NameKey) -> tuple[str | None, str | None]:
-    """("exact" | "fuzzy" | None, near-miss reason | None)."""
+    """Decide whether two normalized names are the same name.
+
+    Spelling differences are counted with rapidfuzz's OSA (optimal string alignment)
+    distance: the number of one-letter insertions, deletions, substitutions and
+    adjacent swaps needed to turn one name into the other.
+
+    Args:
+        a: The first name, as returned by name_key().
+        b: The second name, as returned by name_key().
+
+    Returns:
+        A (match, near_miss) tuple.
+        match is "exact" if the names are written the same, "fuzzy" if they differ
+        only in spacing, punctuation, accents or a few letters (see allowed_edits),
+        and None if they don't match.
+        near_miss is None unless the names don't match but come close. It is then
+        "qualifier differs" or "name too different", for the near-miss review file.
+    """
     if a.raw == b.raw:
         return "exact", None
     if a.compact == b.compact:          # Bear Claw / Bearclaw, Cascapédia / Cascapedia
         return "fuzzy", None
     allowed = allowed_edits(min(len(a.compact), len(b.compact)))
+    # score_cutoff lets OSA stop early: any distance above it comes back as score_cutoff + 1.
     if a.quals != b.quals:              # Upper / Lower White Lightning
-        if a.base and b.base and osa_distance(a.base, b.base, allowed) <= allowed:
+        if a.base and b.base and OSA.distance(a.base, b.base, score_cutoff=allowed) <= allowed:
             return None, "qualifier differs"
         return None, None
-    dist = osa_distance(a.compact, b.compact, allowed + 1)
+    dist = OSA.distance(a.compact, b.compact, score_cutoff=allowed + 1)
     if dist <= allowed:                 # Winnisook / Winisook
         return "fuzzy", None
     if dist == allowed + 1:             # The Vain / The Main
