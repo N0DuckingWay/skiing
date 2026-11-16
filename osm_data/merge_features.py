@@ -35,9 +35,13 @@ Rules (details in osm_data/README.md):
                longest (or largest) piece. Every conflict is recorded.
 Points and unnamed features (apart from inherited names) are never changed.
 
-Usage:
+Typical usage example:
+
     python osm_data/merge_features.py --data-dir "/path/to/osm_data/data"
     python osm_data/merge_features.py --data-dir "/path/to/osm_data/data" --report
+
+--report prints what would be merged and writes nothing. --force rebuilds even when the
+output is newer than the inputs and the rules haven't changed.
 """
 
 from __future__ import annotations
@@ -89,24 +93,45 @@ from common import (
 
 # ---------------------------------------------------------------- rules
 
-METRIC_CRS = EQUAL_AREA_CRS     # distances and lengths; geometry itself stays in EPSG:4326
-LINE_GAP_M = 15.0               # an end of one line within this of the other line
-POLY_GAP_M = 5.0                # polygons within this of each other (or overlapping)
-SHARED_NODE_M = 0.05            # closer than this counts as the same OSM node: no connector
-COPY_WITHIN_M = 3.0             # a line is a copy of another if this share of it lies
-COPY_SHARE = 0.9                # within this distance of the other
-TWIN_LENGTH_RATIO = 0.8         # lifts meeting at both ends with lengths this close are twins
-LENGTH_TOLERANCE = 0.001        # self-check: merged length vs. pieces + connectors
+# Projection used to measure distances, lengths and areas in metres. The geometry that is
+# read and written stays in EPSG:4326 (longitude/latitude).
+METRIC_CRS = EQUAL_AREA_CRS
+# Two lines link when an end of one lies within this many metres of the other line.
+LINE_GAP_M = 15.0
+# Two polygons link when they overlap or lie within this many metres of each other.
+POLY_GAP_M = 5.0
+# A line end closer than this (metres) to the line it links to already touches it (they
+# share an OSM node), so no connector is drawn between them.
+SHARED_NODE_M = 0.05
+# A line is a copy of another (the same run drawn twice) when both its ends, and at least
+# COPY_SHARE of its length, lie within COPY_WITHIN_M metres of the other line. The copy's
+# tags are merged but its geometry is dropped.
+COPY_WITHIN_M = 3.0
+COPY_SHARE = 0.9
+# Two lifts that meet at both ends are twin lifts side by side (two separate lifts, not two
+# sections of one) when the shorter one is at least this fraction of the longer one.
+TWIN_LENGTH_RATIO = 0.8
+# Self-check tolerance, as a fraction (plus 1 m or 1 m²). A merged line must be as long as
+# its pieces plus connectors; a merged polygon's area must lie between its largest piece's
+# area and the sum of its pieces' areas.
+LENGTH_TOLERANCE = 0.001
 
-# Words that tell two runs (or streams) with otherwise the same name apart.
+# Words that tell two runs (or streams) with otherwise the same name apart, such as Upper
+# and Lower White Lightning. Names whose qualifiers differ never merge. French forms are
+# included for Quebec. Numbers, Roman numerals and single letters are qualifiers too (see
+# is_qualifier).
 QUALIFIER_WORDS = frozenset("""
     upper lower middle top bottom lowest uppermost lowermost
     north south east west northeast northwest southeast southwest
     haut haute bas basse superieur superieure inferieur inferieure est ouest nord sud
     left right gauche droite inner outer
 """.split())
+# Roman numerals that number sections or lifts (Gondola I, Gondola II). Also qualifiers.
 ROMAN_NUMERALS = frozenset("i ii iii iv v vi vii viii ix x".split())
+# Dropped from the start of a name of two or more words, so "The Glades" matches "Glades".
 LEADING_ARTICLES = frozenset({"the", "la", "le", "les"})
+# Abbreviations expanded before names are compared, so "Upr Cruiser" matches "Upper
+# Cruiser" and "Mt Snow" matches "Mount Snow".
 ABBREVIATIONS = {
     "upr": "upper", "lwr": "lower", "mid": "middle",
     "n": "north", "s": "south", "e": "east", "w": "west",
@@ -115,36 +140,73 @@ ABBREVIATIONS = {
     "ck": "creek", "crk": "creek",
 }
 
+# piste:difficulty values from easiest to hardest. When pieces disagree, the hardest wins.
 DIFFICULTY_ORDER = ["novice", "easy", "intermediate", "advanced", "expert", "freeride", "extreme"]
+# Position of each difficulty in DIFFICULTY_ORDER; a higher rank is harder.
 DIFFICULTY_RANK = {d: i for i, d in enumerate(DIFFICULTY_ORDER)}
+# Non-standard piste:difficulty values and the standard value each one means.
 DIFFICULTY_ALIASES = {"beginner": "novice", "difficult": "advanced", "hard": "advanced"}
+# Tags that can hold several values separated by ";". When pieces disagree, the merged
+# feature gets every value, the one covering the most length first.
 MULTI_VALUE_KEYS = {"piste:type", "piste:grooming", "ref", "piste:ref", "piste:number", "alt_name"}
-PLUS_SEPARATED_KEYS = {"piste:grooming"}        # classic+skating means classic;skating
+# Multi-value tags whose values may also be separated by "+": classic+skating means
+# classic;skating.
+PLUS_SEPARATED_KEYS = {"piste:grooming"}
+# Yes/no tags that are "yes" on the merged feature if any piece says yes: a run is gladed
+# if any section of it is.
 YES_IF_ANY_KEYS = {"gladed", "lit", "piste:lit", "piste:snowmaking", "patrolled"}
-MOST_COVERAGE_KEYS = {"name", "waterway", "highway"}   # value covering the most length wins
+# Tags whose merged value is the one carried by the most total length (or area) across all
+# pieces. Other conflicting tags take the value of the single longest piece instead.
+MOST_COVERAGE_KEYS = {"name", "waterway", "highway"}
+# Tags that describe a relation itself rather than the feature, so they are never copied
+# onto a merged feature.
 RELATION_ONLY_KEYS = {"type", "route"}
 
+# piste:type values that aren't skiing (hike, sled, snowshoe, ...). A piste with only these
+# types merges only with pistes of exactly the same types (see piste_compatible).
 NON_SKI = frozenset(NON_SKI_PISTE_TYPES)
+# highway values for paths and tracks a ski trail can follow. They all count as one "trail"
+# kind, so a path and a track with the same name can merge.
 TRAIL_HIGHWAYS = frozenset(SKI_TRAIL_HIGHWAYS)
 # One watercourse: a creek can become a river, and a flowline is the river's path through a lake.
 STREAM_RIVER = frozenset({"stream", "river", "flowline"})
+# landuse values for grass. They merge with each other and with natural=grassland.
 GRASS_LANDUSE = frozenset({"grass", "meadow"})
+# Tags that give the kind of any other line, checked in this order (the first one the line
+# has wins): man_made=pipeline, power=line, ...
 LINE_KIND_KEYS = ["man_made", "natural", "highway", "railway", "barrier", "power"]
+# Tags that give a polygon's kind label, checked in this order (the first one it has wins).
 AREA_KIND_KEYS = ["landuse", "natural", "landcover", "leisure", "man_made", "tourism", "amenity",
                   "building", "sport", "wetland"]
-# Relations in these layers with these types can share a name with their ways.
-RELATION_TYPES = {"multilinestrings": None,   # every row
+# Relation layers to read, and which relation type values to read from each (None reads
+# every row). These relations can share a name with their member ways.
+RELATION_TYPES = {"multilinestrings": None,
                   "other_relations": ("waterway", "route", "piste", "multilinestring")}
 
+# Layers this script changes. Every other layer (points) is copied unchanged.
 MERGE_LAYERS = ["lines", "multilinestrings", "multipolygons", "other_relations"]
+# Columns that hold something other than an OSM tag. Currently unused in this script.
 NOT_TAG_COLUMNS = {"fid", "geom", "geometry", "osm_id", "osm_way_id", "other_tags", "z_order"}
+# (column, SQLite type) of the provenance columns added to each layer in MERGE_LAYERS. They
+# stay empty on rows that weren't merged. merge_group is the group id, merged_ids lists the
+# pieces' OSM ids (representative first), merged_count is the number of pieces,
+# merge_match is how the names matched and merge_conflicts holds the tag conflicts as JSON.
 PROVENANCE_COLUMNS = [("merge_group", "TEXT"), ("merged_ids", "TEXT"), ("merged_count", "INTEGER"),
                       ("merge_match", "TEXT"), ("merge_conflicts", "TEXT")]
+# Near-miss codes returned by compare_pairs, and the reason each one stands for.
 NEAR_REASONS = {1: "qualifier differs", 2: "name too different"}
 
 
 def rules() -> dict:
-    """Everything that changes the result, for the up-to-date check."""
+    """List every setting that changes the result, for the up-to-date check.
+
+    main() stores a hash of this dict in ski_nature_merged.json. When the hash changes, the
+    output is rebuilt even if it is newer than the inputs.
+
+    Returns:
+        A dict of setting name to value. It includes an MD5 hash of this script, so any
+        edit to the script (even to a comment) counts as a rule change.
+    """
     return {
         "metric_crs": METRIC_CRS, "line_gap_m": LINE_GAP_M, "poly_gap_m": POLY_GAP_M,
         "shared_node_m": SHARED_NODE_M, "copy_within_m": COPY_WITHIN_M, "copy_share": COPY_SHARE,
@@ -158,20 +220,55 @@ def rules() -> dict:
 
 @dataclass(frozen=True)
 class NameKey:
-    raw: str              # the name as written (trimmed)
-    compact: str          # normalized tokens joined without spaces
-    base: str             # compact without the qualifier tokens
-    quals: frozenset      # qualifier tokens (upper, east, 2, b, ...)
+    """A feature's name, normalized for matching (see name_key).
+
+    Attributes:
+        raw: The name as written in OSM, trimmed.
+        compact: The normalized words joined without spaces, so "Bear Claw" and "Bearclaw"
+            both become "bearclaw".
+        base: compact without the qualifier words: "Upper White Lightning" gives
+            "whitelightning".
+        quals: The qualifier words (upper, east, 2, b, ii, ...) that tell features with
+            otherwise the same name apart.
+    """
+
+    raw: str
+    compact: str
+    base: str
+    quals: frozenset
 
 
 def is_qualifier(token: str) -> bool:
+    """Check whether a word of a name tells same-named features apart.
+
+    Args:
+        token: One normalized word of a name (lowercase, no accents).
+
+    Returns:
+        True if the word is in QUALIFIER_WORDS or ROMAN_NUMERALS, is a single letter or
+        contains a digit (Chair 7, 7A).
+    """
     return (token in QUALIFIER_WORDS or token in ROMAN_NUMERALS or len(token) == 1
             or any(c.isdigit() for c in token))
 
 
 @lru_cache(maxsize=None)
 def name_key(raw: str | None) -> NameKey | None:
-    """Normalize a name for matching: "L. Cruiser" -> lower + cruiser, "Russ's" -> russ."""
+    """Normalize a name for matching.
+
+    Accents and case are removed, & and + become "and", "U." and "L." become upper and
+    lower, the words in ABBREVIATIONS are expanded, and French elisions (l', d', j'),
+    possessives and a leading article are dropped. What's left is split into words of
+    letters and digits. For example "L. Cruiser" gives lower + cruiser and "Russ's" gives
+    russ. Results are cached because the same names come up many times.
+
+    Args:
+        raw: The name as written in OSM. May be None or NaN for unnamed features.
+
+    Returns:
+        The NameKey for the name, or None if there is no name or it has no letters or
+        digits.
+    """
     if not present(raw) or not str(raw).strip():
         return None
     raw = str(raw).strip()
@@ -194,6 +291,15 @@ def name_key(raw: str | None) -> NameKey | None:
 
 
 def allowed_edits(length: int) -> int:
+    """Return how many spelling edits two names may differ by and still match.
+
+    Args:
+        length: Length of the shorter of the two compact names, in characters.
+
+    Returns:
+        2 for names of 16 or more characters, 1 for 8 to 15, and 0 for shorter names,
+        which must match exactly once spaces and punctuation are removed.
+    """
     return 2 if length >= 16 else 1 if length >= 8 else 0
 
 
@@ -213,8 +319,11 @@ def compare_names(a: NameKey, b: NameKey) -> tuple[str | None, str | None]:
         match is "exact" if the names are written the same, "fuzzy" if they differ
         only in spacing, punctuation, accents or a few letters (see allowed_edits),
         and None if they don't match.
-        near_miss is None unless the names don't match but come close. It is then
-        "qualifier differs" or "name too different", for the near-miss review file.
+        near_miss is None unless the names don't match but come close, for the
+        near-miss review file. It is then "qualifier differs" if their qualifier words
+        differ but the rest of the names match (Upper / Lower White Lightning), or
+        "name too different" if they are one edit more than allowed apart
+        (The Vain / The Main).
     """
     if a.raw == b.raw:
         return "exact", None
@@ -238,17 +347,49 @@ def compare_names(a: NameKey, b: NameKey) -> tuple[str | None, str | None]:
 
 @dataclass(frozen=True)
 class Kind:
-    family: str                       # features merge only within a family
-    label: str                        # for the review files: piste:downhill, natural:wood, ...
-    pistes: frozenset | None = None   # piste:type values (piste kinds only)
+    """What sort of feature a row is, which decides what it may merge with.
+
+    Attributes:
+        family: Features merge only within a family, such as "piste",
+            "aerialway:chair_lift", "waterway:stream_river" or "woodland". Pistes must
+            also have compatible piste types (see kinds_compatible).
+        label: A readable kind for the review files, such as "piste:downhill" or
+            "natural:wood".
+        pistes: The piste:type values of a piste or piste relation; None for other kinds.
+    """
+
+    family: str
+    label: str
+    pistes: frozenset | None = None
 
 
 def piste_types(value) -> frozenset:
+    """Split a piste:type value into its separate types.
+
+    Args:
+        value: A piste:type tag value, which may hold several types separated by ";"
+            (e.g. "nordic;hike").
+
+    Returns:
+        The lowercased types, without blanks.
+    """
     return frozenset(v.strip().lower() for v in str(value).split(";") if v.strip())
 
 
 def piste_compatible(a: frozenset, b: frozenset) -> bool:
-    """Ski pistes need a ski type in common; other pistes need the same types."""
+    """Check whether two pistes' types allow them to merge.
+
+    Ski pistes (with any type not in NON_SKI) need a ski type in common: nordic merges with
+    nordic;hike but not with downhill. Pistes with no ski type need exactly the same types,
+    so a hiking trail doesn't merge with a snowshoe trail.
+
+    Args:
+        a: The first piste's types (see piste_types).
+        b: The second piste's types.
+
+    Returns:
+        True if the two pistes can be pieces of one feature.
+    """
     ski_a, ski_b = a - NON_SKI, b - NON_SKI
     if ski_a or ski_b:
         return bool(ski_a & ski_b)
@@ -256,6 +397,16 @@ def piste_compatible(a: frozenset, b: frozenset) -> bool:
 
 
 def kinds_compatible(a: Kind, b: Kind) -> bool:
+    """Check whether two features are of kinds that can merge.
+
+    Args:
+        a: The first feature's kind.
+        b: The second feature's kind.
+
+    Returns:
+        True if both are in the same family and, when both have piste types, those
+        types are compatible (see piste_compatible).
+    """
     if a.family != b.family:
         return False
     if not a.pistes or not b.pistes:     # not a piste, or a relation without piste:type
@@ -264,6 +415,18 @@ def kinds_compatible(a: Kind, b: Kind) -> bool:
 
 
 def line_kind(tags: dict) -> Kind:
+    """Classify a line by its tags.
+
+    The first of these tags that the line has decides its kind: piste:type, aerialway,
+    railway=funicular (counted as a lift), waterway (streams, rivers and flowlines share one
+    family), highway paths and tracks (one "trail" family), then the keys in LINE_KIND_KEYS.
+
+    Args:
+        tags: The line's OSM tags, key to value.
+
+    Returns:
+        The line's Kind, or Kind("other", "other") if none of those tags apply.
+    """
     pt = tags.get("piste:type")
     if pt:
         return Kind("piste", f"piste:{pt}", piste_types(pt))
@@ -285,6 +448,21 @@ def line_kind(tags: dict) -> Kind:
 
 
 def area_kind(tags: dict) -> Kind:
+    """Classify a polygon by its tags.
+
+    Pistes and lifts are classified as in line_kind. A ski area (landuse=winter_sports) is
+    its own family even if it also has tree landcover. Woods and forests share the
+    "woodland" family and grass, meadow and grassland share the "grassland" family, so they
+    merge with each other. Any other polygon's family is its first tag in AREA_KIND_KEYS.
+
+    Args:
+        tags: The polygon's OSM tags, key to value.
+
+    Returns:
+        The polygon's Kind. Apart from pistes and lifts, its label is the polygon's first
+        tag in AREA_KIND_KEYS (e.g. "natural:wood"), so the review files show the
+        original tag.
+    """
     pt = tags.get("piste:type")
     if pt:
         return Kind("piste", f"piste:{pt}", piste_types(pt))
@@ -304,6 +482,16 @@ def area_kind(tags: dict) -> Kind:
 
 
 def relation_kind(tags: dict) -> Kind:
+    """Classify a route, piste or waterway relation by its tags.
+
+    Args:
+        tags: The relation's OSM tags, key to value.
+
+    Returns:
+        The relation's Kind. Its family is "rel:waterway", "rel:piste" (with the piste
+        types, if it has piste:type), "rel:aerialway", "rel:trail" for any other route, or
+        "rel:any". relation_accepts uses the family to decide which ways can belong to it.
+    """
     typ, route = (tags.get("type") or "").lower(), (tags.get("route") or "").lower()
     pt = tags.get("piste:type")
     if typ == "waterway":
@@ -318,7 +506,19 @@ def relation_kind(tags: dict) -> Kind:
 
 
 def relation_accepts(rel: Kind, way: Kind) -> bool:
-    """Can this way be a piece of the same feature as this relation?"""
+    """Check whether a way can be a piece of the same feature as a relation.
+
+    Waterway relations accept any waterway. Piste relations accept pistes of a compatible
+    type, and paths and tracks. Aerialway relations accept lifts but not stations. Other
+    route relations accept paths, tracks and pistes. Any other relation accepts any way.
+
+    Args:
+        rel: The relation's kind (see relation_kind).
+        way: The way's kind (see line_kind).
+
+    Returns:
+        True if the way can be a piece of the relation's feature.
+    """
     if rel.family == "rel:waterway":
         return way.family.startswith("waterway:")
     if rel.family == "rel:piste":
@@ -333,26 +533,68 @@ def relation_accepts(rel: Kind, way: Kind) -> bool:
 
 
 def end_to_end_only(kind: Kind) -> bool:
-    """Lifts join only end to end; a lift touching another mid-way is a different lift."""
+    """Check whether features of this kind may only join end to end.
+
+    Lifts join only end to end, like two sections of a gondola. A lift touching another
+    mid-way is a different lift.
+
+    Args:
+        kind: The feature's kind.
+
+    Returns:
+        True for lifts (every aerialway family, funiculars included).
+    """
     return kind.family.startswith("aerialway:")
 
 
 # ---------------------------------------------------------------- tags
 
 def present(v) -> bool:
+    """Check whether a value read from a table is set.
+
+    Args:
+        v: A value from a DataFrame cell or a SQLite row.
+
+    Returns:
+        False for None, NaN and pd.NA; True for anything else, including "".
+    """
     return v is not None and not (isinstance(v, float) and math.isnan(v)) and v is not pd.NA
 
 
 @lru_cache(maxsize=None)
 def layer_columns(layer: str) -> dict[str, str]:
-    """Column -> OSM key for the tags osmconf.ini makes real columns (piste_type -> piste:type)."""
+    """Map a layer's tag columns to the OSM keys they hold.
+
+    osmconf.ini lists the tags that GDAL turns into columns of their own for each layer.
+    Column names have "_" in place of ":", so the piste_type column holds piste:type. All
+    other tags are in the other_tags column.
+
+    Args:
+        layer: The layer name, which is also its section in osmconf.ini (e.g. "lines").
+
+    Returns:
+        Column name to OSM key, e.g. {"name": "name", "piste_type": "piste:type", ...}.
+    """
     cp = configparser.ConfigParser(interpolation=None, strict=False)
     cp.read(OSMCONF)
     return {k.replace(":", "_"): k for k in cp[layer]["attributes"].split(",")}
 
 
 def parse_other_tags(text) -> dict:
-    """other_tags is written as a Python-style dict ({'sport': 'skiing'}), not strict JSON."""
+    """Read the other_tags column of a row into a dict.
+
+    other_tags is written as a Python-style dict ({'sport': 'skiing'}), not strict JSON,
+    so it is read with ast.literal_eval, falling back to json.loads.
+
+    Args:
+        text: The row's other_tags value. May be None, NaN or empty.
+
+    Returns:
+        Tag key to value, both as strings. Empty if the row has no other tags.
+
+    Raises:
+        json.JSONDecodeError: If the text is neither a Python literal nor JSON.
+    """
     if not present(text) or not str(text).strip():
         return {}
     try:
@@ -363,10 +605,28 @@ def parse_other_tags(text) -> dict:
 
 
 def format_other_tags(tags: dict) -> str | None:
+    """Write tags in the other_tags format, which parse_other_tags reads back.
+
+    Args:
+        tags: Tag key to value, for the tags that have no column of their own.
+
+    Returns:
+        The tags as a Python-style dict sorted by key, or None if there are none.
+    """
     return repr(dict(sorted(tags.items()))) if tags else None
 
 
 def row_tags(row: dict, layer: str) -> dict:
+    """Collect every OSM tag of a row, from its tag columns and its other_tags.
+
+    Args:
+        row: One row of the layer, column name to value.
+        layer: The layer the row comes from, which decides its tag columns (see
+            layer_columns).
+
+    Returns:
+        OSM key to value, as strings, for every tag the row has.
+    """
     cols = layer_columns(layer)
     tags = {key: str(row[col]) for col, key in cols.items() if col in row and present(row[col])}
     tags.update(parse_other_tags(row.get("other_tags")))
@@ -374,6 +634,17 @@ def row_tags(row: dict, layer: str) -> dict:
 
 
 def normalize_difficulty(value: str) -> str | None:
+    """Turn a piste:difficulty value into one of DIFFICULTY_ORDER.
+
+    Case is ignored, DIFFICULTY_ALIASES are applied, and if the whole value isn't a
+    difficulty its first word is tried: "Easy (green circle)" gives "easy".
+
+    Args:
+        value: A piste:difficulty tag value.
+
+    Returns:
+        The standard difficulty, or None if the value isn't one.
+    """
     s = value.strip().lower()
     s = DIFFICULTY_ALIASES.get(s, s)
     if s in DIFFICULTY_RANK:
@@ -384,12 +655,39 @@ def normalize_difficulty(value: str) -> str | None:
 
 
 def split_values(key: str, value: str) -> list[str]:
+    """Split the value of a multi-value tag into its separate values.
+
+    Args:
+        key: The tag key. Values of keys in PLUS_SEPARATED_KEYS are also split on "+".
+        value: The tag value, e.g. "classic;skating".
+
+    Returns:
+        The values in order, stripped, without blanks.
+    """
     sep = r"[;+]" if key in PLUS_SEPARATED_KEYS else r";"
     return [p.strip() for p in re.split(sep, value) if p.strip()]
 
 
 def resolve(key: str, values: list[tuple[str, float]]) -> tuple[str, bool]:
-    """Pick one value for `key` from (value, weight) pairs. Returns (value, is_conflict)."""
+    """Pick one value for a tag whose pieces disagree.
+
+    The first rule that applies decides:
+        * piste:difficulty: the hardest difficulty wins (see normalize_difficulty).
+        * MULTI_VALUE_KEYS: every value is kept, the one with the most weight first.
+        * YES_IF_ANY_KEYS: "yes" if any piece says yes.
+        * MOST_COVERAGE_KEYS: the value with the most weight in total.
+        * Otherwise: the value of the heaviest (longest or largest) single piece.
+
+    Args:
+        key: The OSM tag key.
+        values: A (value, weight) pair for each piece that has the tag. The weight is the
+            piece's length in metres or area in m².
+
+    Returns:
+        A (value, is_conflict) tuple. value is the chosen value. is_conflict is False only
+        for a multi-value tag whose pieces hold the same values written differently
+        (classic+skating, skating;classic), which doesn't need to be recorded.
+    """
     if key == "piste:difficulty":
         ranked = [n for n in (normalize_difficulty(v) for v, _ in values) if n]
         if ranked:
@@ -416,9 +714,19 @@ def resolve(key: str, values: list[tuple[str, float]]) -> tuple[str, bool]:
 
 
 def merge_tags(pieces: list[tuple[dict, float]]) -> tuple[dict, dict]:
-    """Combine the tags of (tags, weight) pieces. Returns (tags, conflicts).
+    """Combine the tags of the pieces of one merged feature.
 
-    conflicts: {key: {"values": [...], "chosen": value}} for every key whose pieces disagree.
+    A tag that all pieces having it agree on is kept as it is. A tag with different values
+    is settled by resolve().
+
+    Args:
+        pieces: A (tags, weight) pair for each piece: its OSM tags, and its length in
+            metres or area in m².
+
+    Returns:
+        A (tags, conflicts) tuple. tags is the merged feature's tags. conflicts has an
+        entry {key: {"values": [each distinct value], "chosen": value}} for every key the
+        pieces disagreed on, except name (name spellings go in the review files instead).
     """
     keys = list(dict.fromkeys(k for tags, _ in pieces for k in tags))
     out, conflicts = {}, {}
@@ -439,6 +747,17 @@ def merge_tags(pieces: list[tuple[dict, float]]) -> tuple[dict, dict]:
 
 @dataclass
 class NearMiss:
+    """A pair of touching features that were not merged (a near miss).
+
+    Attributes:
+        reason: Why they were kept apart: "qualifier differs", "name too different",
+            "different kind", "lifts touch mid-way" or "twin lifts".
+        a: Node index of the first feature (its position in the arrays passed to
+            find_line_links or find_area_links).
+        b: Node index of the second feature.
+        distance: Distance between the two, in metres.
+    """
+
     reason: str
     a: int
     b: int
@@ -447,15 +766,41 @@ class NearMiss:
 
 @dataclass
 class Links:
-    a: np.ndarray                     # edges between node indices
+    """Pairs of features found to be pieces of the same feature.
+
+    Features are identified by node index: their position in the arrays passed to
+    find_line_links or find_area_links.
+
+    Attributes:
+        a: First node of each link.
+        b: Second node of each link, so node a[k] links to node b[k].
+        dist: Distance in metres between the two nodes of each link.
+        copy_of: Node to node, for each line that is a copy of another line (the same run
+            drawn twice). The copy is dropped from the merged geometry.
+        connectors: (node, line) pairs. Each line is a short EPSG:4326 LineString that
+            closes the gap between a line end of that node and the line it links to.
+        near: NearMiss records for touching pairs that were not linked. Only filled in
+            when collect_near is set.
+    """
+
+    a: np.ndarray
     b: np.ndarray
-    dist: np.ndarray                  # metres
-    copy_of: dict = field(default_factory=dict)       # node -> node it duplicates
-    connectors: list = field(default_factory=list)    # (node, LineString in EPSG:4326)
-    near: list = field(default_factory=list)          # NearMiss
+    dist: np.ndarray
+    copy_of: dict = field(default_factory=dict)
+    connectors: list = field(default_factory=list)
+    near: list = field(default_factory=list)
 
 
 def intern(values) -> tuple[np.ndarray, list]:
+    """Number each distinct value, so that each one only needs comparing once.
+
+    Args:
+        values: A sequence of hashable values (NameKeys, Kinds, ...).
+
+    Returns:
+        An (ids, uniques) tuple. uniques lists each distinct value once, in order of first
+        appearance. ids holds, for each value, its position in uniques.
+    """
     ids: dict = {}
     out = np.empty(len(values), np.int64)
     for i, v in enumerate(values):
@@ -464,14 +809,42 @@ def intern(values) -> tuple[np.ndarray, list]:
 
 
 def compare_pairs(keys: list, kinds: list, o: np.ndarray, t: np.ndarray):
-    """Name match code (0 none, 1 exact, 2 fuzzy), near-miss code and kind compatibility per pair.
+    """Compare the names and kinds of many pairs of features.
 
-    Each distinct pair of names or kinds is compared once.
+    Each distinct pair of names, and each distinct pair of kinds, is compared only once.
+    This matters because the hundreds of ways of one river all share a name.
+
+    Args:
+        keys: NameKey of every node. Unnamed nodes (None) must not appear in o or t.
+        kinds: Kind of every node.
+        o: Node index of the first feature of each pair.
+        t: Node index of the second feature of each pair (same length as o).
+
+    Returns:
+        A (match_code, near_code, kind_ok) tuple of arrays with one entry per pair.
+        match_code is 0 if the names don't match, 1 if they match exactly and 2 if they
+        match fuzzily. near_code is 0, or a key of NEAR_REASONS when the names come
+        close without matching. kind_ok is True if the kinds can merge (see
+        kinds_compatible).
     """
     kid, uniq_keys = intern(keys)
     tid, uniq_kinds = intern(kinds)
 
     def per_unique(ids, uniq, fn):
+        """Call fn once for each distinct pair of values.
+
+        Each pair is encoded as one integer (first id * n + second id) so that np.unique
+        can find the distinct pairs.
+
+        Args:
+            ids: For every node, its value's position in uniq (see intern).
+            uniq: The distinct values.
+            fn: The comparison to run on two values (compare_names or kinds_compatible).
+
+        Returns:
+            A (results, inverse) tuple: fn's result for each distinct pair, and for each
+            (o, t) pair the index of its result.
+        """
         n = len(uniq)
         codes, inverse = np.unique(ids[o] * n + ids[t], return_inverse=True)
         results = [fn(uniq[c // n], uniq[c % n]) for c in codes]
@@ -488,6 +861,19 @@ def compare_pairs(keys: list, kinds: list, o: np.ndarray, t: np.ndarray):
 
 
 def near_misses_from(rows: pd.DataFrame, reason_col: str) -> list[NearMiss]:
+    """Turn candidate pairs into near-miss records, one per pair of features.
+
+    The same pair can come up more than once (from each end of a line, or from both
+    features); only the closest is kept.
+
+    Args:
+        rows: One row per candidate pair, with columns o and t (node indexes), d (distance
+            in metres) and the reason column.
+        reason_col: Name of the column that holds each pair's near-miss reason.
+
+    Returns:
+        One NearMiss per pair of nodes, with a < b.
+    """
     if rows.empty:
         return []
     rows = rows.assign(a=np.minimum(rows.o, rows.t), b=np.maximum(rows.o, rows.t))
@@ -498,31 +884,63 @@ def near_misses_from(rows: pd.DataFrame, reason_col: str) -> list[NearMiss]:
 
 def find_line_links(geom: np.ndarray, geom_m: np.ndarray, kinds: list, keys: list,
                     lengths: np.ndarray, collect_near: bool = False) -> Links:
-    """Links between named lines: an end of one within LINE_GAP_M of the other, same kind, names match."""
+    """Find which named lines are pieces of the same feature.
+
+    Two lines link when an end of one lies within LINE_GAP_M of the other line, their kinds
+    are compatible and their names match. On top of that:
+        * Lifts must meet end to end; a lift touching another mid-way doesn't link.
+        * A line drawn twice is a copy (see COPY_WITHIN_M). The shorter one is recorded
+          in copy_of; it still links, so its tags are merged.
+        * Two lifts meeting at both ends with similar lengths are twin lifts side by side
+          (see TWIN_LENGTH_RATIO) and don't link.
+        * Where a linked line end doesn't already touch the other line, a straight
+          connector is made to close the gap.
+
+    Args:
+        geom: Line geometries in EPSG:4326, one per node. Connectors are drawn on these.
+        geom_m: The same lines in METRIC_CRS (metres). Only named nodes need one.
+        kinds: Kind of every node.
+        keys: NameKey of every node, or None if it has no name. Unnamed lines never link.
+        lengths: Length of every line in metres. Only named nodes are used.
+        collect_near: Also record touching pairs that didn't link, for the review file.
+            The self-checks leave this off.
+
+    Returns:
+        The links found. Each pair of nodes appears at most once, with a < b and the
+        shortest distance between them.
+    """
     named = np.flatnonzero(np.array([k is not None for k in keys], bool))
     if len(named) < 2:
         return Links(np.empty(0, np.int64), np.empty(0, np.int64), np.empty(0))
     g = geom_m[named]
     m = len(named)
     starts, ends = shapely.get_point(g, 0), shapely.get_point(g, -1)
+    # pts holds the start of every named line, then the end of every named line, so a hit
+    # on point pi comes from line pi % m, and pi // m says which end (0 start, 1 end).
     pts = np.concatenate([starts, ends])
     pi, ti = shapely.STRtree(g).query(pts, predicate="dwithin", distance=LINE_GAP_M)
     oi, end = pi % m, pi // m
-    keep = oi != ti
+    keep = oi != ti     # a line's own ends always lie on it
     pi, ti, oi, end = pi[keep], ti[keep], oi[keep], end[keep]
     o, t = named[oi], named[ti]
     mcode, ncode, kind_ok = compare_pairs(keys, kinds, o, t)
 
     link = (mcode > 0) & kind_ok
+    # Near misses: the names match but the kinds don't, or the kinds match and the names
+    # come close.
     near = ((mcode > 0) & ~kind_ok) | (kind_ok & (ncode > 0)) if collect_near else np.zeros(len(o), bool)
     sel = np.flatnonzero(link | near)
     p, tt = pts[pi[sel]], ti[sel]
+    # d: from the line end to the other line. dend: from the line end to the nearer end of
+    # the other line, and tend says which end that is (0 start, 1 end).
     d = shapely.distance(p, g[tt])
     ds, de = shapely.distance(p, starts[tt]), shapely.distance(p, ends[tt])
     rows = pd.DataFrame({"o": o[sel], "t": t[sel], "end": end[sel], "d": d,
                          "dend": np.minimum(ds, de), "tend": np.where(ds <= de, 0, 1),
                          "link": link[sel], "mcode": mcode[sel], "ncode": ncode[sel],
                          "kind_ok": kind_ok[sel]})
+    # A lift end that is near the other lift but not near either of its ends touches it
+    # mid-way, so it doesn't link.
     e2e = np.array([end_to_end_only(k) for k in kinds], bool)
     rows.loc[e2e[rows.o.to_numpy()] & (rows.dend > LINE_GAP_M), "link"] = False
 
@@ -590,13 +1008,26 @@ def find_line_links(geom: np.ndarray, geom_m: np.ndarray, kinds: list, keys: lis
 
 
 def find_area_links(geom_m: np.ndarray, kinds: list, keys: list, collect_near: bool = False) -> Links:
-    """Links between named polygons within POLY_GAP_M of each other, same kind, names match."""
+    """Find which named polygons are pieces of the same feature.
+
+    Two polygons link when they overlap or lie within POLY_GAP_M of each other, their kinds
+    are compatible and their names match.
+
+    Args:
+        geom_m: Polygon geometries in METRIC_CRS (metres), one per node.
+        kinds: Kind of every node.
+        keys: NameKey of every node, or None if it has no name. Unnamed polygons never link.
+        collect_near: Also record touching pairs that didn't link, for the review file.
+
+    Returns:
+        The links found, with a < b. copy_of and connectors stay empty for polygons.
+    """
     named = np.flatnonzero(np.array([k is not None for k in keys], bool))
     if len(named) < 2:
         return Links(np.empty(0, np.int64), np.empty(0, np.int64), np.empty(0))
     g = geom_m[named]
     i, j = shapely.STRtree(g).query(g, predicate="dwithin", distance=POLY_GAP_M)
-    keep = i < j
+    keep = i < j        # each pair once, and never a polygon with itself
     o, t = named[i[keep]], named[j[keep]]
     mcode, ncode, kind_ok = compare_pairs(keys, kinds, o, t)
     link = (mcode > 0) & kind_ok
@@ -615,11 +1046,30 @@ def find_area_links(geom_m: np.ndarray, kinds: list, keys: list, collect_near: b
 
 
 def component_labels(n: int, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Group nodes that are linked, directly or through other nodes.
+
+    Args:
+        n: Number of nodes.
+        a: First node of each link.
+        b: Second node of each link.
+
+    Returns:
+        A label for every node. Nodes with the same label form one merged feature; a node
+        without links has a label of its own.
+    """
     graph = coo_matrix((np.ones(len(a)), (a, b)), shape=(n, n))
     return connected_components(graph, directed=False)[1]
 
 
 def to_metric(geoms) -> np.ndarray:
+    """Reproject geometries from EPSG:4326 to METRIC_CRS (metres).
+
+    Args:
+        geoms: Shapely geometries in EPSG:4326 (longitude/latitude).
+
+    Returns:
+        An object array of the reprojected geometries, in the same order.
+    """
     return np.asarray(gpd.GeoSeries(list(geoms), crs=4326).to_crs(METRIC_CRS).array)
 
 
@@ -627,14 +1077,34 @@ def to_metric(geoms) -> np.ndarray:
 
 @dataclass
 class Piece:
-    osm_type: str           # way / relation
+    """One source OSM object that goes into a merged feature.
+
+    Attributes:
+        osm_type: "way" or "relation".
+        osm_id: The way's or relation's OSM id.
+        layer: The ski_nature.gpkg layer it was read from.
+        fid: Its row id in that layer.
+        name: Its own name (name, else piste:name), or None. A name inherited from a
+            relation is not counted here.
+        kind: Its kind label (see Kind.label), for the review files.
+        tags: Its OSM tags, including any name inherited from a relation.
+        size: The length in metres (lines) or area in m² (polygons) it adds. For an
+            absorbed relation, only the parts that aren't already ways in the lines layer.
+        role: What happened to it: "representative" (the merged feature keeps its OSM id),
+            "merged", "copy dropped", "name inherited" or "relation absorbed".
+        gap_m: Distance in metres to the nearest piece it links to, or None if it has no
+            links of its own (an absorbed relation, or a way joined only through one).
+        inherited_from: OSM id of the relation it took its name from, or None.
+    """
+
+    osm_type: str
     osm_id: int
     layer: str
     fid: int
-    name: str | None        # its own name (name, or piste:name)
+    name: str | None
     kind: str
     tags: dict
-    size: float             # metres (lines) or m² (polygons) this piece adds
+    size: float
     role: str = "merged"
     gap_m: float | None = None
     inherited_from: int | None = None
@@ -642,11 +1112,34 @@ class Piece:
 
 @dataclass
 class Group:
+    """A merged feature: one output row made from several pieces.
+
+    merge_line_features also sets two extra attributes on line groups for the length
+    self-check: expected (total length of the pieces that weren't dropped as copies) and
+    connectors (the lines added to close gaps).
+
+    Attributes:
+        layer: The layer the merged row is written to.
+        kind: Kind label of the merged feature; piste:<type> once tags are merged.
+        pieces: The Piece objects that went into it.
+        geom: The merged geometry, in EPSG:4326.
+        rep: The representative piece, whose OSM id the merged row keeps: the longest (or
+            largest) piece that isn't a dropped copy.
+        tags: The merged tags (see merge_tags).
+        conflicts: The tags the pieces disagreed on (see merge_tags).
+        match: How the names matched: "exact", "fuzzy" or "inherited" (see group_match).
+        size_before: Total length (m) or area (m²) of the pieces.
+        size_after: Length or area of the merged geometry.
+        max_gap_m: Longest connector added to close a gap, in metres. Lines only.
+        z_order: The representative's z_order, copied to the merged row. Lines only.
+        fid_after: The merged row's fid in ski_nature_merged.gpkg, filled in once written.
+    """
+
     layer: str
     kind: str
     pieces: list
-    geom: object            # EPSG:4326
-    rep: Piece              # the piece whose id the merged feature keeps
+    geom: object
+    rep: Piece
     tags: dict = field(default_factory=dict)
     conflicts: dict = field(default_factory=dict)
     match: str = "exact"
@@ -658,16 +1151,34 @@ class Group:
 
     @property
     def group_id(self) -> str:
+        """The merged feature's id, e.g. "lines-3f9a0c12bd".
+
+        Written to the merge_group column. It is the layer plus a hash of the sorted piece ids, so the same pieces get the same
+        id on every run.
+        """
         ids = sorted(f"{p.osm_type[0]}{p.osm_id}" for p in self.pieces)
         return f"{self.layer}-{hashlib.sha1(';'.join(ids).encode()).hexdigest()[:10]}"
 
     @property
     def merged_ids(self) -> str:
+        """The pieces' OSM ids, representative first, written to merged_ids.
+
+        Each id has a w (way) or r (relation) prefix, e.g. "w123;w456;r789".
+        """
         rest = sorted((p for p in self.pieces if p is not self.rep), key=lambda p: (p.osm_type, p.osm_id))
         return ";".join(f"{p.osm_type[0]}{p.osm_id}" for p in [self.rep, *rest])
 
 
 def group_match(pieces: list[Piece]) -> str:
+    """Describe how the names of a merged feature's pieces matched.
+
+    Args:
+        pieces: The pieces of the merged feature.
+
+    Returns:
+        "fuzzy" if the pieces' own names are written differently, "inherited" if they are
+        written the same but some piece took its name from a relation, else "exact".
+    """
     names = {p.name for p in pieces if p.name}
     if len(names) > 1:
         return "fuzzy"
@@ -677,6 +1188,16 @@ def group_match(pieces: list[Piece]) -> str:
 
 
 def finish_group(g: Group, weights: list[float]) -> Group:
+    """Fill in a group's merged tags, tag conflicts and name match.
+
+    Args:
+        g: The group. It is changed in place.
+        weights: Length or area of each piece, in the order of g.pieces, used to settle
+            tag conflicts.
+
+    Returns:
+        The same group. Its kind becomes piste:<type> if the merged tags have a piste:type.
+    """
     tagged = [(p.tags, w) for p, w in zip(g.pieces, weights)]
     g.tags, g.conflicts = merge_tags(tagged)
     g.match = group_match(g.pieces)
@@ -686,11 +1207,32 @@ def finish_group(g: Group, weights: list[float]) -> Group:
 
 
 def line_parts(geom) -> list:
+    """Return the non-empty LineStrings among a geometry's parts.
+
+    Args:
+        geom: A LineString, MultiLineString or GeometryCollection. Parts that aren't
+            LineStrings are left out.
+
+    Returns:
+        A list of LineStrings.
+    """
     return [p for p in shapely.get_parts(geom) if p.geom_type == "LineString" and not p.is_empty]
 
 
 def merge_lines(parts: list):
-    """Join line parts into as few lines as possible, keeping their direction where it can."""
+    """Join line parts into as few lines as possible.
+
+    Parts are first joined only where one ends where the next starts, which keeps their
+    direction (OSM draws rivers in the direction they flow, and pistes usually downhill).
+    If ignoring direction gives fewer lines, that result is used instead.
+
+    Args:
+        parts: LineStrings in EPSG:4326, including any connectors.
+
+    Returns:
+        A LineString if the parts form one chain, else a MultiLineString (a forked run, for
+        example).
+    """
     multi = shapely.MultiLineString(parts)
     merged = shapely.line_merge(multi, directed=True)
     if merged.geom_type != "LineString":
@@ -704,6 +1246,20 @@ def merge_lines(parts: list):
 
 @dataclass
 class Relation:
+    """A route, piste or waterway relation and its member ways.
+
+    Attributes:
+        layer: The layer it was read from: "multilinestrings" or "other_relations".
+        fid: Its row id in that layer.
+        osm_id: Its OSM relation id.
+        tags: Its OSM tags.
+        key: Its normalized name (name, else piste:name), or None if it has no name.
+        kind: Its kind (see relation_kind).
+        geom: Its geometry in EPSG:4326, as GDAL built it from the member ways.
+        members: Node indexes (row positions in the lines layer) of its member ways that
+            are in the lines layer. Filled in by merge_line_features.
+    """
+
     layer: str
     fid: int
     osm_id: int
@@ -711,10 +1267,20 @@ class Relation:
     key: NameKey | None
     kind: Kind
     geom: object
-    members: list = field(default_factory=list)    # node indices of member ways in lines
+    members: list = field(default_factory=list)
 
 
 def read_relations(src: Path) -> list[Relation]:
+    """Read the relations that can share a name with their ways.
+
+    Which layers and relation types are read is set by RELATION_TYPES.
+
+    Args:
+        src: Path to ski_nature.gpkg.
+
+    Returns:
+        One Relation per row read, with members still empty.
+    """
     out = []
     for layer, types in RELATION_TYPES.items():
         where = None if types is None else "type IN (" + ", ".join(f"'{t}'" for t in types) + ")"
@@ -728,11 +1294,26 @@ def read_relations(src: Path) -> list[Relation]:
 
 
 def read_relation_members(pbf: Path, wanted: set[int]) -> dict[int, list[int]]:
-    """Member way ids of the wanted relations (the GeoPackage doesn't keep them)."""
+    """Read the member way ids of some relations from the OSM file.
+
+    The GeoPackage has each relation's geometry but not its list of members, so the members
+    are read from the .osm.pbf file with pyosmium.
+
+    Args:
+        pbf: Path to near_runs.osm.pbf.
+        wanted: OSM ids of the relations to look up.
+
+    Returns:
+        Relation id to the ids of its member ways, in member order. Node and relation
+        members are left out, and relations not found in the file are missing.
+    """
     members: dict[int, list[int]] = {}
 
     class Handler(osmium.SimpleHandler):
+        """Collects the member way ids of the wanted relations into members."""
+
         def relation(self, r):
+            """Record the member ways of r if it is a wanted relation."""
             if r.id in wanted:
                 members[r.id] = [m.ref for m in r.members if m.type == "w"]
 
@@ -741,7 +1322,18 @@ def read_relation_members(pbf: Path, wanted: set[int]) -> dict[int, list[int]]:
 
 
 def fetch_rows(src: Path, layer: str, fids) -> dict[int, dict]:
-    """Attribute columns (no geometry) of the given rows, by fid."""
+    """Read the attribute columns (everything but the geometry) of some rows.
+
+    Rows are read 30,000 at a time to stay under SQLite's limit on query parameters.
+
+    Args:
+        src: Path to the GeoPackage.
+        layer: The layer to read from.
+        fids: The rows' fids, in any order. Duplicates are fine.
+
+    Returns:
+        fid to row, where each row maps column name to value (fid included).
+    """
     fids = sorted(set(int(f) for f in fids))
     out = {}
     with connect_ro(src) as con:
@@ -756,6 +1348,17 @@ def fetch_rows(src: Path, layer: str, fids) -> dict[int, dict]:
 
 
 def endpoint_pair(line) -> tuple:
+    """Return a line's first and last points, rounded to about 1 cm.
+
+    Coordinates are rounded to 7 decimal places. Used to tell which parts of a relation's
+    geometry are its member ways.
+
+    Args:
+        line: A LineString in EPSG:4326.
+
+    Returns:
+        A ((x, y), (x, y)) tuple: the start point, then the end point.
+    """
     c = shapely.get_coordinates(line)
     return tuple(np.round(c[0], 7)), tuple(np.round(c[-1], 7))
 
@@ -764,14 +1367,37 @@ def endpoint_pair(line) -> tuple:
 
 @dataclass
 class Result:
+    """Everything the merge found, collected across layers.
+
+    Attributes:
+        groups: The merged features (Group objects) of every layer.
+        near: One dict per near miss, in the merge_near_misses.csv format (see near_row).
+        drops: Layer name to the fids of the input rows that merged rows replace.
+        counts: Per-layer counts for the manifest (rows read, groups, pieces, ...).
+        failures: Self-check problems. If there are any, nothing is written.
+    """
+
     groups: list = field(default_factory=list)
-    near: list = field(default_factory=list)      # dicts for merge_near_misses.csv
-    drops: dict = field(default_factory=dict)     # layer -> fids replaced by merged rows
+    near: list = field(default_factory=list)
+    drops: dict = field(default_factory=dict)
     counts: dict = field(default_factory=dict)
-    failures: list = field(default_factory=list)  # self-check problems
+    failures: list = field(default_factory=list)
 
 
 def near_row(reason: str, layer: str, a: dict, b: dict, distance: float, geom) -> dict:
+    """Build one row of merge_near_misses.csv.
+
+    Args:
+        reason: Why the two features weren't merged (see NearMiss.reason).
+        layer: The layer they are in.
+        a: The first feature, as a dict with keys osm_type, osm_id, name and kind.
+        b: The second feature, with the same keys.
+        distance: The distance between them, in metres.
+        geom: Geometry (EPSG:4326) for the map link to show.
+
+    Returns:
+        The row, column name to value.
+    """
     return {"reason": reason, "layer": layer,
             "kind_a": a["kind"], "osm_type_a": a["osm_type"], "osm_id_a": a["osm_id"],
             "osm_link_a": osm_link(a["osm_type"], a["osm_id"]), "name_a": a["name"],
@@ -781,6 +1407,31 @@ def near_row(reason: str, layer: str, a: dict, b: dict, distance: float, geom) -
 
 
 def merge_line_features(src: Path, pbf: Path, result: Result) -> None:
+    """Merge the lines layer and the route and waterway relations.
+
+    The steps are:
+        1. Read every line's kind and name, and the relations with their member ways.
+        2. R1: an unnamed way in exactly one named relation of a matching kind takes the
+           relation's name.
+        3. R2: a relation whose member ways all carry its name is the same feature as
+           those ways. It is absorbed: merged into them and dropped from its own layer.
+           Parts of its geometry that aren't ways in the lines layer become extra nodes.
+        4. Link touching lines with matching names (find_line_links), group the linked
+           nodes, and build one merged feature per group.
+        5. Self-checks: each merged line is as long as its pieces plus connectors, and
+           running the matching again on the result finds nothing left to merge.
+        6. R3: merge touching same-name relations that weren't absorbed
+           (merge_relation_features).
+
+    Nodes are numbered in the order of the lines layer's rows (0 to n_lines - 1),
+    followed by the extra relation parts.
+
+    Args:
+        src: Path to ski_nature.gpkg.
+        pbf: Path to near_runs.osm.pbf, for the relations' member lists.
+        result: Collects the groups, dropped fids, near misses, counts and self-check
+            failures. Changed in place.
+    """
     started = time.time()
     cols = ["osm_id", "name", "piste_name", "piste_type", "aerialway", "railway", "waterway", "highway",
             "man_made", "natural", "barrier", "power"]
@@ -791,6 +1442,7 @@ def merge_line_features(src: Path, pbf: Path, result: Result) -> None:
     kind_vals = df[kind_cols].to_numpy(object)
 
     def kind_tags(i: int) -> dict:
+        """Return the tags of line i that line_kind looks at, OSM key to value."""
         return {col2key[c]: v for c, v in zip(kind_cols, kind_vals[i]) if present(v)}
 
     kinds = [line_kind(kind_tags(i)) for i in range(len(df))]
@@ -820,12 +1472,15 @@ def merge_line_features(src: Path, pbf: Path, result: Result) -> None:
         for i in r.members:
             if own_keys[i] is None and relation_accepts(r.kind, kinds[i]):
                 claims.setdefault(i, []).append(r)
+    # A way claimed by two or more different relations stays unnamed.
     inherited = {i: rs[0] for i, rs in claims.items() if len(set(id(r) for r in rs)) == 1}
     keys = list(own_keys)
     for i, r in inherited.items():
         keys[i] = r.key
 
     # R2: a relation whose member ways all carry its name is the same feature as those ways.
+    # A relation that isn't absorbed but shares a name with one of its ways is listed in
+    # the near-miss file as "relation kept".
     absorbed: list[Relation] = []
     kept_with_match: list[tuple[Relation, int]] = []
     for r in relations:
@@ -869,6 +1524,7 @@ def merge_line_features(src: Path, pbf: Path, result: Result) -> None:
     all_geom = np.concatenate([geom, np.array(v_geom, dtype=object)]) if v_geom else geom
     all_kinds = link_kinds + v_kind
     all_keys = keys + v_key
+    # Only named nodes can link, so only they need metric geometry and lengths.
     named = np.flatnonzero(np.array([k is not None for k in all_keys], bool))
     geom_m = np.empty(n, dtype=object)
     geom_m[named] = to_metric(all_geom[named])
@@ -879,9 +1535,11 @@ def merge_line_features(src: Path, pbf: Path, result: Result) -> None:
 
     links = find_line_links(all_geom, geom_m, all_kinds, all_keys, lengths, collect_near=True)
     a, b = [links.a], [links.b]
-    rel_nodes: dict[int, list[int]] = {}      # id(relation) -> its nodes
+    rel_nodes: dict[int, list[int]] = {}      # id(relation) -> its extra-part nodes
     for k, r in enumerate(v_rel):
         rel_nodes.setdefault(id(r), []).append(n_lines + k)
+    # An absorbed relation's ways and extra parts form one group even where they don't
+    # touch: link its first node to each of the others.
     for r in absorbed:
         nodes = r.members + rel_nodes.get(id(r), [])
         a.append(np.full(len(nodes) - 1, nodes[0], np.int64))
@@ -895,6 +1553,8 @@ def merge_line_features(src: Path, pbf: Path, result: Result) -> None:
     rel_by_label: dict[int, list[Relation]] = {}
     for r in absorbed:
         rel_by_label.setdefault(int(labels[r.members[0]]), []).append(r)
+    # Nodes to merge: those in a component of two or more nodes, plus the single way of a
+    # relation with one member (the relation is still absorbed into it).
     grouped = np.flatnonzero((sizes[labels] > 1) | np.isin(labels, list(rel_by_label)))
     by_label: dict[int, list[int]] = {}
     for i in grouped:
@@ -902,7 +1562,7 @@ def merge_line_features(src: Path, pbf: Path, result: Result) -> None:
     connectors_by_label: dict[int, list] = {}
     for node, line in links.connectors:
         connectors_by_label.setdefault(int(labels[node]), []).append(line)
-    gap = {}
+    gap = {}    # node -> distance to the nearest node it links to (Piece.gap_m)
     for x, y, d in zip(links.a, links.b, links.dist):
         gap[x] = min(gap.get(x, d), d)
         gap[y] = min(gap.get(y, d), d)
@@ -930,6 +1590,7 @@ def merge_line_features(src: Path, pbf: Path, result: Result) -> None:
                     p.role = "name inherited"
             pieces.append(p)
             weights.append(p.size)
+        # The representative is the longest way that isn't a dropped copy.
         rep = max(pieces, key=lambda p: (p.role != "copy dropped", p.size))
         if rep.role != "copy dropped":
             rep.role = "representative"
@@ -946,6 +1607,7 @@ def merge_line_features(src: Path, pbf: Path, result: Result) -> None:
         g = Group("lines", kinds[rep_index(ways, osm_ids, rep)].label, pieces, merged, rep,
                   size_before=float(sum(p.size for p in pieces)),
                   z_order=int(rows[rep.fid].get("z_order") or 0))
+        # Extra attributes for the length self-check below.
         g.expected = float(sum(p.size for p in pieces if p.role != "copy dropped"))   # type: ignore[attr-defined]
         g.connectors = conns                                                          # type: ignore[attr-defined]
         groups.append(finish_group(g, weights))
@@ -972,6 +1634,7 @@ def merge_line_features(src: Path, pbf: Path, result: Result) -> None:
 
     # Near misses, described by node.
     def node_info(i: int) -> dict:
+        """Describe node i (a way or an extra relation part) for near_row."""
         if i < n_lines:
             return {"osm_type": "way", "osm_id": int(osm_ids[i]), "name": own_names[i] or "", "kind": kinds[i].label}
         r = v_rel[i - n_lines]
@@ -992,7 +1655,8 @@ def merge_line_features(src: Path, pbf: Path, result: Result) -> None:
                               "groups": len(groups), "pieces": int(len(way_nodes))}
 
     # Self-check: run the same matching on the result. Nothing should link any more, apart
-    # from the parts of one forked feature.
+    # from the parts of one forked feature. f_owner says where each line came from: the
+    # index of its merged group, or -1 - node for a named way that wasn't merged.
     grouped_set = set(grouped.tolist())
     keep = [i for i in range(n_lines) if i not in grouped_set and own_keys[i] is not None]
     f_geom, f_kinds, f_keys, f_owner = [], [], [], []
@@ -1009,6 +1673,7 @@ def merge_line_features(src: Path, pbf: Path, result: Result) -> None:
     clash = [(x, y) for x, y in zip(again.a, again.b) if owner[x] != owner[y]]
 
     def describe(x: int) -> str:
+        """Describe line x of the self-check for a failure message."""
         k = owner[x]
         what = (f"merged {groups[k].group_id}" if k >= 0 else f"way/{osm_ids[-1 - k]} (fid {fids[-1 - k]})")
         return f"{f_keys[x].raw!r} {f_kinds[x].label} [{what}]"
@@ -1025,11 +1690,32 @@ def merge_line_features(src: Path, pbf: Path, result: Result) -> None:
 
 
 def rep_index(ways: list[int], osm_ids: np.ndarray, rep: Piece) -> int:
+    """Find the node index of a group's representative way.
+
+    Args:
+        ways: Node indexes of the group's ways.
+        osm_ids: OSM way id of every node in the lines layer.
+        rep: The group's representative piece, which is always a way.
+
+    Returns:
+        The node in ways whose OSM id is the representative's.
+    """
     return next(i for i in ways if osm_ids[i] == rep.osm_id)
 
 
 def merge_relation_features(relations: list[Relation], absorbed: list[Relation], result: Result) -> None:
-    """R3: route relations left over that share a name and touch become one relation."""
+    """R3: merge leftover relations that share a name and touch.
+
+    Relations already absorbed into their ways are skipped. Within each relation layer,
+    relations whose lines lie within LINE_GAP_M of each other, with matching names and
+    compatible kinds, become one relation. Their lines are joined (see merge_lines); in
+    other_relations, any parts that aren't LineStrings are kept alongside.
+
+    Args:
+        relations: Every relation read by read_relations.
+        absorbed: The relations already merged into their member ways.
+        result: Collects the new groups and the dropped fids. Changed in place.
+    """
     taken = {id(r) for r in absorbed}
     for layer in RELATION_TYPES:
         rels = [r for r in relations if r.layer == layer and id(r) not in taken and r.key is not None]
@@ -1074,6 +1760,18 @@ def merge_relation_features(relations: list[Relation], absorbed: list[Relation],
 # ---------------------------------------------------------------- the multipolygons layer
 
 def merge_area_features(src: Path, result: Result) -> None:
+    """Merge named polygons in the multipolygons layer that are one feature.
+
+    Linked polygons (see find_area_links) are unioned into one MultiPolygon. Woods and
+    forests get the kind "woodland", and grass, meadow and grassland the kind "grassland".
+    Self-checks: each merged area lies between its largest piece's area and the sum of its
+    pieces' areas (overlaps count once), and nothing links any more after merging.
+
+    Args:
+        src: Path to ski_nature.gpkg.
+        result: Collects the groups, dropped fids, near misses, counts and self-check
+            failures. Changed in place.
+    """
     started = time.time()
     df = pyogrio.read_dataframe(src, layer="multipolygons", where="name IS NOT NULL OR piste_name IS NOT NULL",
                                 fid_as_index=True)
@@ -1093,6 +1791,14 @@ def merge_area_features(src: Path, result: Result) -> None:
         gap[y] = min(gap.get(y, d), d)
 
     def ident(r: dict) -> tuple[str, int]:
+        """Return a polygon row's (OSM type, OSM id).
+
+        GDAL fills osm_id for polygons built from relations and osm_way_id for polygons
+        built from closed ways.
+
+        Args:
+            r: One row of the multipolygons layer, column name to value.
+        """
         return ("relation", int(r["osm_id"])) if present(r.get("osm_id")) else ("way", int(r["osm_way_id"]))
 
     groups = []
@@ -1122,6 +1828,7 @@ def merge_area_features(src: Path, result: Result) -> None:
     result.drops.setdefault("multipolygons", []).extend(dropped)
 
     def info(k: int) -> dict:
+        """Describe polygon k for near_row."""
         ot, oid = ident(records[k])
         return {"osm_type": ot, "osm_id": oid, "name": keys[k].raw if keys[k] else "", "kind": kinds[k].label}
 
@@ -1146,7 +1853,21 @@ def merge_area_features(src: Path, result: Result) -> None:
 # ---------------------------------------------------------------- writing
 
 def output_frame(groups: list[Group], layer: str, columns: list[str]) -> gpd.GeoDataFrame:
-    """Merged rows with exactly the layer's columns, in the layer's order."""
+    """Build one layer's merged rows, ready to append to the output.
+
+    Tags that have a column of their own go in that column and the rest go in other_tags.
+    The id columns get the representative's OSM id, and the provenance columns are filled
+    in from the group.
+
+    Args:
+        groups: The merged features of this layer.
+        layer: The layer name.
+        columns: The layer's output columns, in order, without fid and geom.
+
+    Returns:
+        A GeoDataFrame in EPSG:4326 with exactly those columns plus the geometry, one row
+        per group.
+    """
     col2key = layer_columns(layer)
     rows = []
     for g in groups:
@@ -1158,6 +1879,8 @@ def output_frame(groups: list[Group], layer: str, columns: list[str]) -> gpd.Geo
         for col in columns:
             if col in row:
                 continue
+            # In multipolygons, osm_id is only set for relations and osm_way_id for
+            # closed ways, as GDAL writes them.
             if col == "osm_id":
                 row[col] = str(g.rep.osm_id) if (layer != "multipolygons" or g.rep.osm_type == "relation") else None
             elif col == "osm_way_id":
@@ -1186,6 +1909,22 @@ def output_frame(groups: list[Group], layer: str, columns: list[str]) -> gpd.Geo
 
 
 def write_output(src: Path, dst: Path, result: Result) -> dict:
+    """Write ski_nature_merged.gpkg, with merged rows in place of their pieces.
+
+    Every layer of src is copied to a temporary file, keeping its fids. The merged layers
+    get the provenance columns, lose the rows that were merged, and gain the merged rows.
+    Each merged row's fid is then read back into its group (Group.fid_after) and the row
+    counts are checked. The temporary file replaces dst only if every check passes;
+    otherwise it is left in place for inspection.
+
+    Args:
+        src: Path to ski_nature.gpkg.
+        dst: Path to write (ski_nature_merged.gpkg).
+        result: The merge result. Problems found are added to result.failures.
+
+    Returns:
+        Row counts per layer: {layer: {"before", "replaced", "merged_features", "after"}}.
+    """
     tmp = tmp_path(dst)
     tmp.unlink(missing_ok=True)
     # Copy every layer keeping its fids. Forked runs are MultiLineStrings, so the lines
@@ -1199,6 +1938,8 @@ def write_output(src: Path, dst: Path, result: Result) -> dict:
     con = sqlite3.connect(tmp)
     try:
         before = {layer: con.execute(f'SELECT COUNT(*) FROM "{layer}"').fetchone()[0] for layer in MERGE_LAYERS}
+        # The fids to delete go through a temporary table, since there can be more of
+        # them than SQLite allows as query parameters.
         con.execute("CREATE TEMP TABLE drop_fids (fid INTEGER PRIMARY KEY)")
         for layer in MERGE_LAYERS:
             for col, typ in PROVENANCE_COLUMNS:
@@ -1246,10 +1987,30 @@ def write_output(src: Path, dst: Path, result: Result) -> dict:
 # ---------------------------------------------------------------- review files
 
 def osm_link(osm_type: str, osm_id: int) -> str:
+    """Return the openstreetmap.org page of an OSM object.
+
+    Args:
+        osm_type: "node", "way" or "relation".
+        osm_id: The object's OSM id.
+
+    Returns:
+        A URL such as https://www.openstreetmap.org/way/123.
+    """
     return f"https://www.openstreetmap.org/{osm_type}/{osm_id}"
 
 
 def map_link(geom) -> str:
+    """Return an openstreetmap.org map link that shows a geometry.
+
+    The map has a marker on a point inside the geometry, and is zoomed (between levels 4
+    and 18) so the whole geometry fits.
+
+    Args:
+        geom: A shapely geometry in EPSG:4326, or None.
+
+    Returns:
+        The URL, or "" if there is no geometry.
+    """
     if geom is None or geom.is_empty:
         return ""
     p = shapely.point_on_surface(geom)
@@ -1260,6 +2021,16 @@ def map_link(geom) -> str:
 
 
 def group_rows(groups: list[Group]) -> list[dict]:
+    """Build the rows of merge_groups.csv, one per merged feature.
+
+    Args:
+        groups: The merged features.
+
+    Returns:
+        One row per group, column name to value: its ids and links, its names and
+        difficulty before and after merging, its tag conflicts, and its length (lines) or
+        area (polygons) before and after.
+    """
     out = []
     for g in groups:
         is_area = g.layer == "multipolygons"
@@ -1289,6 +2060,16 @@ def group_rows(groups: list[Group]) -> list[dict]:
 
 
 def piece_rows(groups: list[Group]) -> list[dict]:
+    """Build the rows of merge_pieces.csv, one per source object.
+
+    Args:
+        groups: The merged features.
+
+    Returns:
+        One row per piece of each group, column name to value: its ids and link, its role
+        in the group, its gap to the nearest piece it links to, its size, and a few key
+        tags as they were before merging.
+    """
     out = []
     for g in groups:
         for p in g.pieces:
@@ -1307,6 +2088,15 @@ def piece_rows(groups: list[Group]) -> list[dict]:
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
+    """Write rows to a CSV file.
+
+    The rows go to a temporary file first, so a crash never leaves a partial file.
+
+    Args:
+        path: Where to write.
+        rows: The rows. The first row's keys become the header. With no rows the file is
+            empty.
+    """
     tmp = tmp_path(path)
     with tmp.open("w", newline="", encoding="utf-8") as f:
         if rows:
@@ -1316,6 +2106,9 @@ def write_csv(path: Path, rows: list[dict]) -> None:
     finish(tmp, path)
 
 
+# Template for merge_review.html. write_review replaces __DATA__ with the review data as
+# JSON ({"meta": text, "groups": rows, "near": rows}). The page switches between merged
+# features and near misses, filters them, and links each object to openstreetmap.org.
 REVIEW_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Merge review</title>
@@ -1373,6 +2166,20 @@ $('table').onchange=()=>{options();render()};for(const id of ['kind','match','q'
 
 
 def write_review(out: Path, result: Result, snapshot: str | None) -> dict:
+    """Write the review files: three CSV files and merge_review.html.
+
+    The CSV files are merge_groups.csv (one row per merged feature), merge_pieces.csv (one
+    row per source object) and merge_near_misses.csv (touching pairs that weren't merged).
+    The HTML page shows the groups and near misses with filters.
+
+    Args:
+        out: The output directory.
+        result: The merge result.
+        snapshot: Timestamp of the OSM data, shown on the review page, or None if unknown.
+
+    Returns:
+        The number of rows in each CSV file, by file name, for the manifest.
+    """
     groups, pieces = group_rows(result.groups), piece_rows(result.groups)
     write_csv(out / "merge_groups.csv", groups)
     write_csv(out / "merge_pieces.csv", pieces)
@@ -1384,6 +2191,7 @@ def write_review(out: Path, result: Result, snapshot: str | None) -> dict:
                     "openstreetmap.org (use the History tab if they changed after the snapshot).",
             "groups": [{k: r[k] for k in keep} for r in groups], "near": result.near}
     tmp = tmp_path(out / "merge_review.html")
+    # "</" is escaped so that no value can close the <script> tag that holds the data.
     tmp.write_text(REVIEW_HTML.replace("__DATA__", json.dumps(data, ensure_ascii=False).replace("</", "<\\/")),
                    encoding="utf-8")
     finish(tmp, out / "merge_review.html")
@@ -1393,6 +2201,17 @@ def write_review(out: Path, result: Result, snapshot: str | None) -> dict:
 # ---------------------------------------------------------------- summary
 
 def summary(result: Result) -> dict:
+    """Count merged features by layer and kind, and near misses by reason.
+
+    Args:
+        result: The merge result.
+
+    Returns:
+        A dict with two entries. "by_kind" maps "<layer> <kind>" to counts of groups,
+        pieces, fuzzy and inherited name matches, groups with tag conflicts and absorbed
+        relations, sorted by most pieces first. "near_misses" maps each reason to its
+        count.
+    """
     by_kind: dict[str, dict] = {}
     for g in result.groups:
         s = by_kind.setdefault(f"{g.layer} {g.kind}", {"groups": 0, "pieces": 0, "fuzzy": 0, "inherited": 0,
@@ -1410,6 +2229,11 @@ def summary(result: Result) -> dict:
 
 
 def print_report(result: Result) -> None:
+    """Print the summary table, near-miss counts and self-check failures.
+
+    Args:
+        result: The merge result.
+    """
     s = summary(result)
     print(f"\n{'layer / kind':<44} {'groups':>8} {'pieces':>9} {'fuzzy':>7} {'inherit':>8} {'conflict':>9} {'rels':>6}")
     for kind, c in s["by_kind"].items():
@@ -1424,6 +2248,13 @@ def print_report(result: Result) -> None:
 # ---------------------------------------------------------------- main
 
 def main() -> None:
+    """Run the merge step from the command line.
+
+    The options are described in the module docstring, which is also the --help text.
+    Does nothing if ski_nature_merged.gpkg is newer than its inputs and the rules haven't
+    changed, unless --force is given. With --report, prints what would be merged and
+    writes nothing. Exits with an error if an input is missing or a self-check fails.
+    """
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR,
                     help=f"where data is stored (default: {DEFAULT_DATA_DIR})")

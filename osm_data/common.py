@@ -87,17 +87,45 @@ def now_iso() -> str:
 
 
 def connect_ro(gpkg: Path) -> sqlite3.Connection:
-    """Open a GeoPackage read-only with plain sqlite3."""
+    """Open a GeoPackage read-only with plain sqlite3.
+
+    Opening it read-only means a script can't change its input by mistake.
+
+    Args:
+        gpkg: Path to the .gpkg file.
+
+    Returns:
+        A read-only sqlite3 connection to the file.
+    """
     return sqlite3.connect(gpkg.resolve().as_uri() + "?mode=ro", uri=True)
 
 
 def fid_range(gpkg: Path, layer: str) -> tuple[int | None, int | None]:
+    """Return the smallest and largest fid in a GeoPackage layer.
+
+    Args:
+        gpkg: Path to the .gpkg file.
+        layer: Name of the layer.
+
+    Returns:
+        A (min_fid, max_fid) tuple, or (None, None) if the layer has no rows.
+    """
     with connect_ro(gpkg) as con:
         return con.execute(f'SELECT MIN(fid), MAX(fid) FROM "{layer}"').fetchone()
 
 
 def polygonal(geom):
-    """The polygon parts of `geom` as a MultiPolygon, or None if it has none."""
+    """Keep only the polygon parts of a geometry.
+
+    Collections are searched all the way down, so polygons inside a GeometryCollection are
+    found too. Points and lines are dropped.
+
+    Args:
+        geom: Any shapely geometry, such as the result of make_valid or union_all.
+
+    Returns:
+        The polygons as one MultiPolygon, or None if there are none.
+    """
     import shapely
 
     parts, todo = [], list(shapely.get_parts(geom))

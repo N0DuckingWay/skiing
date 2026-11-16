@@ -18,6 +18,15 @@ import merge_features as mf  # noqa: E402
 # ---------------------------------------------------------------- names
 
 def match(a, b):
+    """Compare two names as written in OSM.
+
+    Args:
+        a: The first name.
+        b: The second name.
+
+    Returns:
+        compare_names' (match, near_miss) tuple for the two names.
+    """
     return mf.compare_names(mf.name_key(a), mf.name_key(b))
 
 
@@ -149,16 +158,31 @@ def test_relation_accepts():
 # ---------------------------------------------------------------- linking (coordinates in metres)
 
 def links_for(lines, names, tags):
+    """Run find_line_links on a few test lines.
+
+    The coordinates are used as metres directly, so the same geometry is passed as both
+    the EPSG:4326 and the metric geometry.
+
+    Args:
+        lines: One list of (x, y) coordinates per line, in metres.
+        names: The name of each line, or None for an unnamed line.
+        tags: The OSM tags of each line, which decide its kind.
+
+    Returns:
+        A (links, geom) tuple: the Links found, and the lines as an array of LineStrings.
+    """
     geom = np.array([shapely.LineString(c) for c in lines], dtype=object)
     kinds = [mf.line_kind(t) for t in tags]
     keys = [mf.name_key(n) for n in names]
     return mf.find_line_links(geom, geom, kinds, keys, shapely.length(geom), collect_near=True), geom
 
 
+# Tags of a downhill run, the kind most tests use.
 DOWNHILL = {"piste:type": "downhill"}
 
 
 def edges(links):
+    """Return the links as a sorted list of (a, b) node pairs."""
     return sorted(zip(links.a.tolist(), links.b.tolist()))
 
 
@@ -169,6 +193,7 @@ def test_chain_merges_into_one_line():
 
 
 def test_fork_becomes_multilinestring():
+    """A run that forks at x=100: all three pieces link, into two lines."""
     links, geom = links_for([[(0, 0), (100, 0)], [(100, 0), (200, 50)], [(100, 0), (200, -50)]],
                             ["Pika"] * 3, [DOWNHILL] * 3)
     assert edges(links) == [(0, 1), (0, 2), (1, 2)]
@@ -176,6 +201,7 @@ def test_fork_becomes_multilinestring():
 
 
 def test_small_gap_gets_a_connector():
+    """A 10 m gap (under LINE_GAP_M) is closed by a 10 m connector."""
     links, geom = links_for([[(0, 0), (100, 0)], [(110, 0), (200, 0)]], ["Tempest"] * 2, [DOWNHILL] * 2)
     assert edges(links) == [(0, 1)]
     assert len(links.connectors) == 1 and links.connectors[0][1].length == pytest.approx(10)
@@ -184,16 +210,19 @@ def test_small_gap_gets_a_connector():
 
 
 def test_gap_too_wide_does_not_link():
+    """A 20 m gap is more than LINE_GAP_M, so the two pieces stay apart."""
     links, _ = links_for([[(0, 0), (100, 0)], [(120, 0), (200, 0)]], ["Tempest"] * 2, [DOWNHILL] * 2)
     assert edges(links) == []
 
 
 def test_line_drawn_twice_is_a_copy():
+    """A slightly shorter line 1 m beside the first is a copy of it."""
     links, _ = links_for([[(0, 0), (100, 0)], [(0, 1), (98, 1)]], ["Pinnacles"] * 2, [DOWNHILL] * 2)
     assert links.copy_of == {1: 0}
 
 
 def test_twin_lifts_stay_apart():
+    """Two same-length rope tows 8 m apart are two lifts, not one."""
     tow = {"aerialway": "rope_tow"}
     links, _ = links_for([[(0, 0), (150, 0)], [(0, 8), (150, 8)]], ["Dual Tow"] * 2, [tow] * 2)
     assert edges(links) == []
@@ -201,6 +230,7 @@ def test_twin_lifts_stay_apart():
 
 
 def test_lift_sections_join_end_to_end_but_not_mid_way():
+    """Gondola sections meeting end to end link; chairs touching mid-way don't."""
     gondola = {"aerialway": "gondola"}
     links, _ = links_for([[(0, 0), (1000, 0)], [(1000, 0), (1700, 300)]], ["Sunshine Gondola"] * 2, [gondola] * 2)
     assert edges(links) == [(0, 1)]
