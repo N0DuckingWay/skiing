@@ -22,8 +22,9 @@ Rules (details in osm_data/README.md):
                possessives, u./l. and other abbreviations). Small spelling differences are
                allowed (one edit from 8 letters, two from 16) only if the qualifier words
                match (upper/lower, east/west, numbers, single letters, ...).
-    location   lines: an end of one is within 15 m of the other. Lifts must meet end to
-               end, and side-by-side twin lifts are kept apart. Polygons: within 5 m.
+    location   lines: an end of one is within 15 m of the other on the ground. Lifts
+               must meet end to end, and side-by-side twin lifts are kept apart.
+               Polygons: within 5 m.
     kind       only the same kind of feature merges (downhill with downhill, a lift with
                the same lift type, stream with river, woods with forest, grass with
                meadow, ...).
@@ -68,6 +69,7 @@ import numpy as np
 import osmium
 import pandas as pd
 import pyogrio
+import pyproj
 import shapely
 from rapidfuzz.distance import OSA
 from scipy.sparse import coo_matrix
@@ -93,9 +95,15 @@ from common import (
 
 # ---------------------------------------------------------------- rules
 
-# Projection used to measure distances, lengths and areas in metres. The geometry that is
-# read and written stays in EPSG:4326 (longitude/latitude).
-METRIC_CRS = EQUAL_AREA_CRS
+# Distances and lengths in metres are measured on the ground, along the WGS84 ellipsoid
+# (see ground_distance and ground_length), so a 15 m gap means 15 m everywhere. To find
+# what lies near what, geometry is projected to METRIC_CRS, the North America Lambert
+# Conformal Conic. Being conformal, it scales every short distance near a point by the
+# same factor (see stretch), so the nearest points in it are the nearest points on the
+# ground. The geometry that is read and written stays in EPSG:4326 (longitude/latitude).
+METRIC_CRS = "ESRI:102009"
+# Areas are measured in this equal-area projection, which keeps them true everywhere.
+AREA_CRS = EQUAL_AREA_CRS
 # Two lines link when an end of one lies within this many metres of the other line.
 LINE_GAP_M = 15.0
 # Two polygons link when they overlap or lie within this many metres of each other.
@@ -213,7 +221,7 @@ def rules() -> dict:
         edit to the script (even to a comment) counts as a rule change.
     """
     return {
-        "metric_crs": METRIC_CRS, "line_gap_m": LINE_GAP_M, "poly_gap_m": POLY_GAP_M,
+        "metric_crs": METRIC_CRS, "area_crs": AREA_CRS, "line_gap_m": LINE_GAP_M, "poly_gap_m": POLY_GAP_M,
         "shared_node_m": SHARED_NODE_M, "copy_within_m": COPY_WITHIN_M, "copy_share": COPY_SHARE,
         "twin_length_ratio": TWIN_LENGTH_RATIO, "twin_apart_m": TWIN_APART_M,
         "twin_overlap_share": TWIN_OVERLAP_SHARE, "qualifiers": sorted(QUALIFIER_WORDS),
@@ -761,7 +769,7 @@ class NearMiss:
         a: Node index of the first feature (its position in the arrays passed to
             find_line_links or find_area_links).
         b: Node index of the second feature.
-        distance: Distance between the two, in metres.
+        distance: Distance between the two on the ground, in metres.
     """
 
     reason: str
@@ -780,7 +788,7 @@ class Links:
     Attributes:
         a: First node of each link.
         b: Second node of each link, so node a[k] links to node b[k].
-        dist: Distance in metres between the two nodes of each link.
+        dist: Distance in metres on the ground between the two nodes of each link.
         copy_of: Node to node, for each line that is a copy of another line (the same run
             drawn twice). The copy is dropped from the merged geometry.
         connectors: (node, line) pairs. Each line is a short EPSG:4326 LineString that
@@ -892,8 +900,8 @@ def find_line_links(geom: np.ndarray, geom_m: np.ndarray, kinds: list, keys: lis
                     lengths: np.ndarray, collect_near: bool = False) -> Links:
     """Find which named lines are pieces of the same feature.
 
-    Two lines link when an end of one lies within LINE_GAP_M of the other line, their kinds
-    are compatible and their names match. On top of that:
+    Two lines link when an end of one lies within LINE_GAP_M of the other line on the
+    ground, their kinds are compatible and their names match. On top of that:
         * Lifts must meet end to end; a lift touching another mid-way doesn't link.
         * A line drawn twice is a copy (see COPY_WITHIN_M). The shorter one is recorded
           in copy_of; it still links, so its tags are merged.
@@ -904,27 +912,32 @@ def find_line_links(geom: np.ndarray, geom_m: np.ndarray, kinds: list, keys: lis
 
     Args:
         geom: Line geometries in EPSG:4326, one per node. Connectors are drawn on these.
-        geom_m: The same lines in METRIC_CRS (metres). Only named nodes need one.
+        geom_m: The same lines in METRIC_CRS. Only named nodes need one.
         kinds: Kind of every node.
         keys: NameKey of every node, or None if it has no name. Unnamed lines never link.
-        lengths: Length of every line in metres. Only named nodes are used.
+        lengths: Length of every line in metres on the ground (see ground_length). Only
+            named nodes are used.
         collect_near: Also record touching pairs that didn't link, for the review file.
             The self-checks leave this off.
 
     Returns:
         The links found. Each pair of nodes appears at most once, with a < b and the
-        shortest distance between them.
+        shortest distance between them on the ground.
     """
     named = np.flatnonzero(np.array([k is not None for k in keys], bool))
     if len(named) < 2:
         return Links(np.empty(0, np.int64), np.empty(0, np.int64), np.empty(0))
     g = geom_m[named]
     m = len(named)
+    scale = np.ones(len(geom))
+    scale[named] = stretch(geom[named])
     starts, ends = shapely.get_point(g, 0), shapely.get_point(g, -1)
     # pts holds the start of every named line, then the end of every named line, so a hit
     # on point pi comes from line pi % m, and pi // m says which end (0 start, 1 end).
     pts = np.concatenate([starts, ends])
-    pi, ti = shapely.STRtree(g).query(pts, predicate="dwithin", distance=LINE_GAP_M)
+    # The search reaches at least LINE_GAP_M on the ground; ground distances decide below.
+    radius = LINE_GAP_M * np.tile(scale[named], 2)
+    pi, ti = shapely.STRtree(g).query(pts, predicate="dwithin", distance=radius)
     oi, end = pi % m, pi // m
     keep = oi != ti     # a line's own ends always lie on it
     pi, ti, oi, end = pi[keep], ti[keep], oi[keep], end[keep]
@@ -936,11 +949,14 @@ def find_line_links(geom: np.ndarray, geom_m: np.ndarray, kinds: list, keys: lis
     # come close.
     near = ((mcode > 0) & ~kind_ok) | (kind_ok & (ncode > 0)) if collect_near else np.zeros(len(o), bool)
     sel = np.flatnonzero(link | near)
+    # d: from the line end to the other line, on the ground. Only pairs within LINE_GAP_M
+    # go on.
+    d = ground_distance(pts[pi[sel]], g[ti[sel]])
+    sel, d = sel[d <= LINE_GAP_M], d[d <= LINE_GAP_M]
     p, tt = pts[pi[sel]], ti[sel]
-    # d: from the line end to the other line. dend: from the line end to the nearer end of
-    # the other line, and tend says which end that is (0 start, 1 end).
-    d = shapely.distance(p, g[tt])
-    ds, de = shapely.distance(p, starts[tt]), shapely.distance(p, ends[tt])
+    # dend: from the line end to the nearer end of the other line, and tend says which end
+    # that is (0 start, 1 end).
+    ds, de = ground_distance(p, starts[tt]), ground_distance(p, ends[tt])
     rows = pd.DataFrame({"o": o[sel], "t": t[sel], "end": end[sel], "d": d,
                          "dend": np.minimum(ds, de), "tend": np.where(ds <= de, 0, 1),
                          "link": link[sel], "mcode": mcode[sel], "ncode": ncode[sel],
@@ -966,8 +982,11 @@ def find_line_links(geom: np.ndarray, geom_m: np.ndarray, kinds: list, keys: lis
         lo, lt = lengths[oo], lengths[tt_]
         if lo > lt or (lo == lt and oo < tt_) or oo in out.copy_of:
             continue
-        inside = shapely.length(shapely.intersection(geom_m[oo], shapely.buffer(geom_m[tt_], COPY_WITHIN_M + 0.5)))
-        if inside >= COPY_SHARE * max(lo, 1e-9):
+        # The share is measured in METRIC_CRS, with the buffer widened to COPY_WITHIN_M on
+        # the ground (plus 0.5 m of slack). Both lengths scale alike, so the share is true.
+        zone = shapely.buffer(geom_m[tt_], (COPY_WITHIN_M + 0.5) * scale[tt_])
+        inside = shapely.length(shapely.intersection(geom_m[oo], zone))
+        if inside >= COPY_SHARE * max(shapely.length(geom_m[oo]), 1e-9):
             out.copy_of[int(oo)] = int(tt_)
 
     # Twin lifts: two lifts of similar length running alongside each other are two lifts side
@@ -1007,7 +1026,14 @@ def find_line_links(geom: np.ndarray, geom_m: np.ndarray, kinds: list, keys: lis
                 line = shapely.LineString([ep, shapely.get_point(geom[tt_], 0 if tend == 0 else -1)])
             else:
                 key = (oo, e, tt_)
-                line = shapely.shortest_line(ep, geom[tt_])
+                # The nearest point on the other line is found in METRIC_CRS, where it is
+                # the nearest on the ground (in longitude/latitude it isn't), then placed
+                # on the EPSG:4326 line.
+                ep_m = shapely.get_point(geom_m[oo], 0 if e == 0 else -1)
+                x, y = shapely.get_coordinates(shapely.shortest_line(ep_m, geom_m[tt_]))[1]
+                near = shapely.Point(FROM_METRIC.transform(x, y))
+                line = shapely.LineString([ep, shapely.line_interpolate_point(
+                    geom[tt_], shapely.line_locate_point(geom[tt_], near))])
             if key not in seen:
                 seen.add(key)
                 out.connectors.append((int(oo), line))
@@ -1017,14 +1043,14 @@ def find_line_links(geom: np.ndarray, geom_m: np.ndarray, kinds: list, keys: lis
 def runs_alongside(a, b) -> float | None:
     """Check whether the shorter of two lines runs alongside the longer one.
 
-    Both ends of the shorter line must lie within TWIN_APART_M of the longer line, and the
-    stretch of the longer line between the points nearest those ends must be at least
-    TWIN_OVERLAP_SHARE of the shorter line's length. Two sections of one lift fail this:
-    the far end of one lies away from the other.
+    Both ends of the shorter line must lie within TWIN_APART_M of the longer line on the
+    ground, and the stretch of the longer line between the points nearest those ends must
+    be at least TWIN_OVERLAP_SHARE of the shorter line's length. Two sections of one lift
+    fail this: the far end of one lies away from the other.
 
     Args:
-        a: The first line, in METRIC_CRS (metres).
-        b: The second line, in METRIC_CRS (metres).
+        a: The first line, in METRIC_CRS.
+        b: The second line, in METRIC_CRS.
 
     Returns:
         How far apart the two lines run, in metres (the larger distance from an end of the
@@ -1034,21 +1060,24 @@ def runs_alongside(a, b) -> float | None:
     if short.length == 0:
         return None
     s, e = shapely.get_point(short, 0), shapely.get_point(short, -1)
-    apart = max(long.distance(s), long.distance(e))
+    apart = ground_distance(np.array([s, e]), long).max()
     if apart > TWIN_APART_M:
         return None
+    # Both lengths here are in METRIC_CRS and scale alike, so their ratio is true.
     overlap = abs(shapely.line_locate_point(long, s) - shapely.line_locate_point(long, e))
     return float(apart) if overlap >= TWIN_OVERLAP_SHARE * short.length else None
 
 
-def find_area_links(geom_m: np.ndarray, kinds: list, keys: list, collect_near: bool = False) -> Links:
+def find_area_links(geom: np.ndarray, geom_m: np.ndarray, kinds: list, keys: list,
+                    collect_near: bool = False) -> Links:
     """Find which named polygons are pieces of the same feature.
 
-    Two polygons link when they overlap or lie within POLY_GAP_M of each other, their kinds
-    are compatible and their names match.
+    Two polygons link when they overlap or lie within POLY_GAP_M of each other on the
+    ground, their kinds are compatible and their names match.
 
     Args:
-        geom_m: Polygon geometries in METRIC_CRS (metres), one per node.
+        geom: Polygon geometries in EPSG:4326, one per node.
+        geom_m: The same polygons in METRIC_CRS, valid (see shapely.make_valid).
         kinds: Kind of every node.
         keys: NameKey of every node, or None if it has no name. Unnamed polygons never link.
         collect_near: Also record touching pairs that didn't link, for the review file.
@@ -1060,14 +1089,18 @@ def find_area_links(geom_m: np.ndarray, kinds: list, keys: list, collect_near: b
     if len(named) < 2:
         return Links(np.empty(0, np.int64), np.empty(0, np.int64), np.empty(0))
     g = geom_m[named]
-    i, j = shapely.STRtree(g).query(g, predicate="dwithin", distance=POLY_GAP_M)
+    # The search reaches at least POLY_GAP_M on the ground; ground distances decide below.
+    radius = POLY_GAP_M * stretch(geom[named])
+    i, j = shapely.STRtree(g).query(g, predicate="dwithin", distance=radius)
     keep = i < j        # each pair once, and never a polygon with itself
     o, t = named[i[keep]], named[j[keep]]
     mcode, ncode, kind_ok = compare_pairs(keys, kinds, o, t)
     link = (mcode > 0) & kind_ok
     near = ((mcode > 0) & ~kind_ok) | (kind_ok & (ncode > 0)) if collect_near else np.zeros(len(o), bool)
     sel = np.flatnonzero(link | near)
-    rows = pd.DataFrame({"o": o[sel], "t": t[sel], "d": shapely.distance(geom_m[o[sel]], geom_m[t[sel]]),
+    d = ground_distance(geom_m[o[sel]], geom_m[t[sel]])
+    sel, d = sel[d <= POLY_GAP_M], d[d <= POLY_GAP_M]
+    rows = pd.DataFrame({"o": o[sel], "t": t[sel], "d": d,
                          "link": link[sel], "mcode": mcode[sel], "ncode": ncode[sel], "kind_ok": kind_ok[sel]})
     out = Links(rows.o[rows.link].to_numpy(np.int64), rows.t[rows.link].to_numpy(np.int64),
                 rows.d[rows.link].to_numpy())
@@ -1095,16 +1128,78 @@ def component_labels(n: int, a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return connected_components(graph, directed=False)[1]
 
 
-def to_metric(geoms) -> np.ndarray:
-    """Reproject geometries from EPSG:4326 to METRIC_CRS (metres).
+def to_metric(geoms, crs: str = METRIC_CRS) -> np.ndarray:
+    """Reproject geometries from EPSG:4326 to a projection in metres.
 
     Args:
         geoms: Shapely geometries in EPSG:4326 (longitude/latitude).
+        crs: The projection: METRIC_CRS to find what lies near what, or AREA_CRS to
+            measure areas.
 
     Returns:
         An object array of the reprojected geometries, in the same order.
     """
-    return np.asarray(gpd.GeoSeries(list(geoms), crs=4326).to_crs(METRIC_CRS).array)
+    return np.asarray(gpd.GeoSeries(list(geoms), crs=4326).to_crs(crs).array)
+
+
+# The WGS84 ellipsoid, on which ground distances and lengths are measured.
+GEOD = pyproj.Geod(ellps="WGS84")
+# METRIC_CRS itself, for its scale factors, and the way back from it to EPSG:4326.
+METRIC_PROJ = pyproj.Proj(METRIC_CRS)
+FROM_METRIC = pyproj.Transformer.from_crs(METRIC_CRS, 4326, always_xy=True)
+
+
+def stretch(geoms) -> np.ndarray:
+    """Find how much METRIC_CRS stretches short distances on each geometry, at most.
+
+    METRIC_CRS scales a short distance by a factor that depends only on latitude: 1 at
+    20° N and 60° N, down to 0.94 near 41° N between them, and more than 1 further north
+    (1.11 at 70° N). Multiplying a distance in metres by this factor gives a search radius
+    in METRIC_CRS that reaches just as far on the ground. Because the factor only falls
+    and then rises from south to north, its largest value on a geometry is at the
+    geometry's southern or northern edge.
+
+    Args:
+        geoms: Geometries in EPSG:4326.
+
+    Returns:
+        The largest scale factor on each geometry: METRIC_CRS metres per metre on the
+        ground.
+    """
+    west, south, _, north = shapely.bounds(geoms).T
+    scale = METRIC_PROJ.get_factors(np.r_[west, west], np.r_[south, north]).parallel_scale
+    return np.asarray(scale).reshape(2, -1).max(axis=0)
+
+
+def ground_distance(a, b) -> np.ndarray:
+    """Measure the distance on the ground between pairs of geometries in METRIC_CRS.
+
+    The nearest points of each pair are found in METRIC_CRS, which keeps the shape of small
+    things, so they are the nearest points on the ground too. The distance between them is
+    then measured along the WGS84 ellipsoid.
+
+    Args:
+        a: Non-empty geometries in METRIC_CRS, or a single one.
+        b: Non-empty geometries in METRIC_CRS, as many as in a, or a single one.
+
+    Returns:
+        The distance of each pair in metres.
+    """
+    xy = shapely.get_coordinates(shapely.shortest_line(a, b))   # each line's two ends in turn
+    lon, lat = FROM_METRIC.transform(xy[:, 0], xy[:, 1])
+    return np.asarray(GEOD.inv(lon[0::2], lat[0::2], lon[1::2], lat[1::2])[2])
+
+
+def ground_length(geoms) -> np.ndarray:
+    """Measure the length of lines on the ground, along the WGS84 ellipsoid.
+
+    Args:
+        geoms: Geometries in EPSG:4326.
+
+    Returns:
+        The length of each geometry in metres (a polygon's perimeter, 0 for a point).
+    """
+    return np.array([GEOD.geometry_length(g) for g in geoms], dtype=float)
 
 
 # ---------------------------------------------------------------- merged features
@@ -1535,7 +1630,8 @@ def merge_line_features(src: Path, pbf: Path, result: Result) -> None:
     rel_kind: dict[int, Kind] = {}
     for r in absorbed:
         rel_tags = {k: v for k, v in r.tags.items() if k not in RELATION_ONLY_KEYS}
-        pieces = [(kind_tags(i), float(shapely.length(geom[i]))) for i in r.members] + [(rel_tags, 0.0)]
+        pieces = [(kind_tags(i), float(length)) for i, length in zip(r.members, ground_length(geom[r.members]))]
+        pieces.append((rel_tags, 0.0))
         rel_kind[id(r)] = line_kind(merge_tags(pieces)[0])
         for i in r.members:
             link_kinds[i] = rel_kind[id(r)]
@@ -1563,7 +1659,7 @@ def merge_line_features(src: Path, pbf: Path, result: Result) -> None:
     geom_m = np.empty(n, dtype=object)
     geom_m[named] = to_metric(all_geom[named])
     lengths = np.zeros(n)
-    lengths[named] = shapely.length(geom_m[named])
+    lengths[named] = ground_length(all_geom[named])
     log.info("inherited names: %d ways; relations absorbed: %d (%d extra parts); metric transform done (%.0f s)",
              len(inherited), len(absorbed), len(v_geom), time.time() - started)
 
@@ -1648,9 +1744,9 @@ def merge_line_features(src: Path, pbf: Path, result: Result) -> None:
 
     # Lengths after merging, and the length self-check.
     if groups:
-        after = shapely.length(to_metric([g.geom for g in groups]))
+        after = ground_length([g.geom for g in groups])
         conn_all = [c for g in groups for c in g.connectors]
-        conn_len = shapely.length(to_metric(conn_all)) if conn_all else np.empty(0)
+        conn_len = ground_length(conn_all)
         k = 0
         for g, length in zip(groups, after):
             cl = conn_len[k:k + len(g.connectors)]
@@ -1702,7 +1798,7 @@ def merge_line_features(src: Path, pbf: Path, result: Result) -> None:
             f_geom.append(part); f_kinds.append(kind); f_keys.append(key); f_owner.append(k)
     f_geom = np.array(f_geom, dtype=object)
     f_m = to_metric(f_geom)
-    again = find_line_links(f_geom, f_m, f_kinds, f_keys, shapely.length(f_m))
+    again = find_line_links(f_geom, f_m, f_kinds, f_keys, ground_length(f_geom))
     owner = np.array(f_owner)
     clash = [(x, y) for x, y in zip(again.a, again.b) if owner[x] != owner[y]]
 
@@ -1741,9 +1837,9 @@ def merge_relation_features(relations: list[Relation], absorbed: list[Relation],
     """R3: merge leftover relations that share a name and touch.
 
     Relations already absorbed into their ways are skipped. Within each relation layer,
-    relations whose lines lie within LINE_GAP_M of each other, with matching names and
-    compatible kinds, become one relation. Their lines are joined (see merge_lines); in
-    other_relations, any parts that aren't LineStrings are kept alongside.
+    relations whose lines lie within LINE_GAP_M of each other on the ground, with matching
+    names and compatible kinds, become one relation. Their lines are joined (see
+    merge_lines); in other_relations, any parts that aren't LineStrings are kept alongside.
 
     Args:
         relations: Every relation read by read_relations.
@@ -1755,11 +1851,14 @@ def merge_relation_features(relations: list[Relation], absorbed: list[Relation],
         rels = [r for r in relations if r.layer == layer and id(r) not in taken and r.key is not None]
         if len(rels) < 2:
             continue
-        geoms = np.array([r.geom for r in rels], dtype=object)
-        gm = to_metric(geoms)
-        lines_only = np.array([shapely.MultiLineString(line_parts(g)) if line_parts(g) else g for g in gm], dtype=object)
-        i, j = shapely.STRtree(lines_only).query(lines_only, predicate="dwithin", distance=LINE_GAP_M)
+        lines_only = np.array([shapely.MultiLineString(line_parts(r.geom)) if line_parts(r.geom) else r.geom
+                               for r in rels], dtype=object)
+        gm = to_metric(lines_only)
+        radius = LINE_GAP_M * stretch(lines_only)
+        i, j = shapely.STRtree(gm).query(gm, predicate="dwithin", distance=radius)
         keep = i < j
+        i, j = i[keep], j[keep]
+        keep = ground_distance(gm[i], gm[j]) <= LINE_GAP_M
         i, j = i[keep], j[keep]
         ok = [compare_names(rels[x].key, rels[y].key)[0] is not None and kinds_compatible(rels[x].kind, rels[y].kind)
               for x, y in zip(i, j)]
@@ -1767,7 +1866,7 @@ def merge_relation_features(relations: list[Relation], absorbed: list[Relation],
         if not len(i):
             continue
         labels = component_labels(len(rels), i, j)
-        lengths = shapely.length(lines_only)
+        lengths = ground_length(lines_only)
         for label in np.unique(labels[np.concatenate([i, j])]):
             members = [k for k in range(len(rels)) if labels[k] == label]
             pieces = [Piece("relation", rels[k].osm_id, layer, rels[k].fid, rels[k].key.raw, rels[k].kind.label,
@@ -1784,7 +1883,7 @@ def merge_relation_features(relations: list[Relation], absorbed: list[Relation],
                 out_geom = shapely.GeometryCollection(merged_parts + other)
             g = Group(layer, rels[members[0]].kind.label, pieces, out_geom, rep,
                       size_before=float(sum(p.size for p in pieces)))
-            g.size_after = float(shapely.length(to_metric([out_geom])[0]))
+            g.size_after = float(ground_length([out_geom])[0])
             result.groups.append(finish_group(g, [p.size for p in pieces]))
             result.drops.setdefault(layer, []).extend(p.fid for p in pieces)
         log.info("%s: merged %d touching same-name relations into %d", layer,
@@ -1815,9 +1914,9 @@ def merge_area_features(src: Path, result: Result) -> None:
     keys = [name_key(t.get("name") or t.get("piste:name")) for t in tags]
     geom = shapely.make_valid(np.asarray(df.geometry.array))
     geom_m = shapely.make_valid(to_metric(geom))
-    areas = shapely.area(geom_m)
+    areas = shapely.area(shapely.make_valid(to_metric(geom, AREA_CRS)))
     fids = df.index.to_numpy(np.int64)
-    links = find_area_links(geom_m, kinds, keys, collect_near=True)
+    links = find_area_links(geom, geom_m, kinds, keys, collect_near=True)
     labels = component_labels(len(df), links.a, links.b)
     gap = {}
     for x, y, d in zip(links.a, links.b, links.dist):
@@ -1851,7 +1950,7 @@ def merge_area_features(src: Path, result: Result) -> None:
                   size_before=float(sum(p.size for p in pieces)))
         groups.append(finish_group(g, [p.size for p in pieces]))
     if groups:
-        for g, area in zip(groups, shapely.area(to_metric([g.geom for g in groups]))):
+        for g, area in zip(groups, shapely.area(to_metric([g.geom for g in groups], AREA_CRS))):
             g.size_after = float(area)
             biggest = max(p.size for p in g.pieces)
             if area > g.size_before * (1 + LENGTH_TOLERANCE) + 1 or area < biggest * (1 - LENGTH_TOLERANCE) - 1:
@@ -1874,10 +1973,11 @@ def merge_area_features(src: Path, result: Result) -> None:
     in_group = set(dropped)
     keep = [k for k in range(len(df)) if int(fids[k]) not in in_group]
     merged_m = list(to_metric([g.geom for g in groups])) if groups else []
+    f_geom = np.array([geom[k] for k in keep] + [g.geom for g in groups], dtype=object)
     f_m = np.array([geom_m[k] for k in keep] + merged_m, dtype=object)
     f_kinds = [kinds[k] for k in keep] + [area_kind(g.tags) for g in groups]
     f_keys = [keys[k] for k in keep] + [name_key(g.tags.get("name") or g.tags.get("piste:name")) for g in groups]
-    again = find_area_links(shapely.make_valid(f_m), f_kinds, f_keys)
+    again = find_area_links(f_geom, shapely.make_valid(f_m), f_kinds, f_keys)
     for x, y in list(zip(again.a, again.b))[:20]:
         result.failures.append(f"polygons still link after merging: {f_keys[x].raw!r} and {f_keys[y].raw!r}")
     log.info("multipolygons: %d merged features from %d pieces (%.0f s)", len(groups), len(dropped),

@@ -146,7 +146,8 @@ New columns on every layer except `points` (empty on untouched rows):
   - Small misspellings are allowed: one letter in names of 8+ letters, two in names of 16+ ("Winnisook" = "Winisook").
   - Qualifier words must be the same: upper/lower/middle, north/south/east/west (and French equivalents), numbers, single letters and roman numerals. So "Upper White Lightning" ≠ "Lower White Lightning" and "Gondola I" ≠ "Gondola II".
   - `piste:name` is used when there is no `name`.
-- **They touch.** For lines, an end of one is within 15 m of the other, or the gap is closed with a short straight connector. For polygons, they are within 5 m or overlap.
+- **They touch.** For lines, an end of one is within 15 m of the other; any gap is closed with a short straight connector. For polygons, they are within 5 m or overlap.
+  - Distances and lengths are measured on the ground (on the WGS84 ellipsoid), so 15 m is 15 m everywhere. A single map projection of North America would be off by up to 6% in the contiguous US, and more in the far north.
 - **Same kind of feature:**
   - Ski pistes need a ski type in common (`nordic` merges with `nordic;hike`; downhill never merges with nordic).
   - Lifts need the same `aerialway` value and must meet end to end. A lift never merges with its station. Two lifts of similar length (within 80%) that run side by side, no more than 30 m apart, stay separate: twin rope tows, dual zip lines, or the two cables of a tram drawn in opposite directions, where only one pair of ends meets (the Sandia Peak Aerial Tramway).

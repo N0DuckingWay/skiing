@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pyproj
 import pytest
 import shapely
 
@@ -157,24 +158,41 @@ def test_relation_accepts():
 
 # ---------------------------------------------------------------- linking (coordinates in metres)
 
+# Test geometry is drawn in metres east (x) and north (y) of a point in Colorado, then
+# turned into longitude/latitude, as the script reads it, through an azimuthal equidistant
+# projection centred there, which keeps distances this short true.
+FROM_LOCAL = pyproj.Transformer.from_crs("+proj=aeqd +lat_0=39.6 +lon_0=-106 +datum=WGS84", 4326,
+                                         always_xy=True)
+
+
+def lonlat(coords):
+    """Turn (x, y) coordinates in metres around the test point into an EPSG:4326 line."""
+    x, y = np.asarray(coords, float).T
+    return shapely.LineString(np.column_stack(FROM_LOCAL.transform(x, y)))
+
+
+def metric(coords):
+    """Turn (x, y) coordinates in metres around the test point into a METRIC_CRS line."""
+    return mf.to_metric([lonlat(coords)])[0]
+
+
 def links_for(lines, names, tags):
     """Run find_line_links on a few test lines.
 
-    The coordinates are used as metres directly, so the same geometry is passed as both
-    the EPSG:4326 and the metric geometry.
-
     Args:
-        lines: One list of (x, y) coordinates per line, in metres.
+        lines: One list of (x, y) coordinates per line, in metres around the test point.
         names: The name of each line, or None for an unnamed line.
         tags: The OSM tags of each line, which decide its kind.
 
     Returns:
-        A (links, geom) tuple: the Links found, and the lines as an array of LineStrings.
+        A (links, geom) tuple: the Links found, and the lines as an array of EPSG:4326
+        LineStrings.
     """
-    geom = np.array([shapely.LineString(c) for c in lines], dtype=object)
+    geom = np.array([lonlat(c) for c in lines], dtype=object)
     kinds = [mf.line_kind(t) for t in tags]
     keys = [mf.name_key(n) for n in names]
-    return mf.find_line_links(geom, geom, kinds, keys, shapely.length(geom), collect_near=True), geom
+    links = mf.find_line_links(geom, mf.to_metric(geom), kinds, keys, mf.ground_length(geom), collect_near=True)
+    return links, geom
 
 
 # Tags of a downhill run, the kind most tests use.
@@ -204,15 +222,69 @@ def test_small_gap_gets_a_connector():
     """A 10 m gap (under LINE_GAP_M) is closed by a 10 m connector."""
     links, geom = links_for([[(0, 0), (100, 0)], [(110, 0), (200, 0)]], ["Tempest"] * 2, [DOWNHILL] * 2)
     assert edges(links) == [(0, 1)]
-    assert len(links.connectors) == 1 and links.connectors[0][1].length == pytest.approx(10)
+    assert len(links.connectors) == 1
+    assert mf.ground_length([links.connectors[0][1]])[0] == pytest.approx(10, abs=0.01)
     merged = mf.merge_lines(list(geom) + [c for _, c in links.connectors])
-    assert merged.geom_type == "LineString" and merged.length == pytest.approx(200)
+    assert merged.geom_type == "LineString" and mf.ground_length([merged])[0] == pytest.approx(200, abs=0.01)
+
+
+def test_connector_takes_the_shortest_way_on_the_ground():
+    """A connector to the middle of a diagonal line is as long as the gap: 10 m.
+
+    Drawn as the shortest line in longitude/latitude, which bends angles, it would be 10.3 m.
+    """
+    s = 10 / np.sqrt(2)
+    lines = [[(0, 0), (200, 200)], [(100 - s, 100 + s), (100 - 10 * s, 100 + 10 * s)]]
+    links, geom = links_for(lines, ["Bowl"] * 2, [DOWNHILL] * 2)
+    assert edges(links) == [(0, 1)] and len(links.connectors) == 1
+    connector = links.connectors[0][1]
+    assert mf.ground_length([connector])[0] == pytest.approx(10, abs=0.01)
+    assert shapely.distance(shapely.get_point(connector, -1), geom[0]) < 1e-9
 
 
 def test_gap_too_wide_does_not_link():
     """A 20 m gap is more than LINE_GAP_M, so the two pieces stay apart."""
     links, _ = links_for([[(0, 0), (100, 0)], [(120, 0), (200, 0)]], ["Tempest"] * 2, [DOWNHILL] * 2)
     assert edges(links) == []
+
+
+def test_gaps_are_measured_on_the_ground():
+    """LINE_GAP_M is 15 m on the ground whichever way the gap runs.
+
+    In Colorado the projection used before (ESRI:102008) measured east-west gaps 6% short
+    and north-south gaps 6% long, so the 15.5 m gap linked and the 14.5 m gap didn't.
+    """
+    east, _ = links_for([[(0, 0), (100, 0)], [(115.5, 0), (200, 0)]], ["Tempest"] * 2, [DOWNHILL] * 2)
+    north, _ = links_for([[(0, 0), (0, 100)], [(0, 114.5), (0, 200)]], ["Tempest"] * 2, [DOWNHILL] * 2)
+    assert edges(east) == []
+    assert edges(north) == [(0, 1)] and north.dist[0] == pytest.approx(14.5, abs=0.01)
+
+
+def test_polygon_gaps_are_measured_on_the_ground():
+    """POLY_GAP_M is 5 m on the ground: woods 5.3 m apart stay apart, 4.8 m apart link.
+
+    The projection used before got both wrong in Colorado, as in the test above.
+    """
+    def woods(dx, dy):
+        """Link two 100 m squares of wood, the second one moved by (dx, dy) metres."""
+        square = np.array([(0, 0), (100, 0), (100, 100), (0, 100), (0, 0)], float)
+        geom = np.array([shapely.Polygon(lonlat(c).coords) for c in (square, square + (dx, dy))], dtype=object)
+        kinds = [mf.area_kind({"natural": "wood"})] * 2
+        keys = [mf.name_key("Stevens Memorial Forest")] * 2
+        return edges(mf.find_area_links(geom, mf.to_metric(geom), kinds, keys))
+
+    assert woods(105.3, 0) == []
+    assert woods(0, 104.8) == [(0, 1)]
+
+
+def test_stretch_is_largest_at_the_southern_or_northern_edge():
+    """stretch relies on the scale factor falling and then rising from south to north."""
+    lat = np.arange(20, 85, 0.05)
+    scale = mf.stretch(shapely.points(np.full_like(lat, -106), lat))
+    low = scale.argmin()
+    assert (np.diff(scale[:low + 1]) < 0).all() and (np.diff(scale[low:]) > 0).all()
+    line = shapely.LineString([(-106, 30), (-106, 50)])     # crosses the lowest point
+    assert mf.stretch([line])[0] == pytest.approx(scale[(lat >= 30) & (lat <= 50)].max())
 
 
 def test_line_drawn_twice_is_a_copy():
@@ -242,10 +314,10 @@ def test_twin_lifts_drawn_in_opposite_directions_stay_apart():
 
 def test_runs_alongside():
     """Side-by-side lines run alongside; sections in a row and a short spur don't."""
-    line = shapely.LineString([(0, 0), (1000, 0)])
-    assert mf.runs_alongside(line, shapely.LineString([(1000, 9), (0, 9)])) == pytest.approx(9)
-    assert mf.runs_alongside(line, shapely.LineString([(1000, 0), (1700, 300)])) is None
-    assert mf.runs_alongside(line, shapely.LineString([(500, 0), (500, 400)])) is None
+    line = metric([(0, 0), (1000, 0)])
+    assert mf.runs_alongside(line, metric([(1000, 9), (0, 9)])) == pytest.approx(9, abs=0.01)
+    assert mf.runs_alongside(line, metric([(1000, 0), (1700, 300)])) is None
+    assert mf.runs_alongside(line, metric([(500, 0), (500, 400)])) is None
 
 
 def test_lift_sections_join_end_to_end_but_not_mid_way():
