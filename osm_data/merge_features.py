@@ -108,9 +108,14 @@ SHARED_NODE_M = 0.05
 # tags are merged but its geometry is dropped.
 COPY_WITHIN_M = 3.0
 COPY_SHARE = 0.9
-# Two lifts that meet at both ends are twin lifts side by side (two separate lifts, not two
-# sections of one) when the shorter one is at least this fraction of the longer one.
+# Two linked lifts are twin lifts side by side (two separate lifts, not two sections of one)
+# when the shorter one is at least TWIN_LENGTH_RATIO of the longer one's length, both its
+# ends lie within TWIN_APART_M metres of the longer one, and it runs alongside the longer one
+# for at least TWIN_OVERLAP_SHARE of its length (see runs_alongside). Sections of one lift
+# meet at one end and then lead away from each other, so they never run alongside.
 TWIN_LENGTH_RATIO = 0.8
+TWIN_APART_M = 30.0
+TWIN_OVERLAP_SHARE = 0.8
 # Self-check tolerance, as a fraction (plus 1 m or 1 m²). A merged line must be as long as
 # its pieces plus connectors; a merged polygon's area must lie between its largest piece's
 # area and the sum of its pieces' areas.
@@ -210,7 +215,8 @@ def rules() -> dict:
     return {
         "metric_crs": METRIC_CRS, "line_gap_m": LINE_GAP_M, "poly_gap_m": POLY_GAP_M,
         "shared_node_m": SHARED_NODE_M, "copy_within_m": COPY_WITHIN_M, "copy_share": COPY_SHARE,
-        "twin_length_ratio": TWIN_LENGTH_RATIO, "qualifiers": sorted(QUALIFIER_WORDS),
+        "twin_length_ratio": TWIN_LENGTH_RATIO, "twin_apart_m": TWIN_APART_M,
+        "twin_overlap_share": TWIN_OVERLAP_SHARE, "qualifiers": sorted(QUALIFIER_WORDS),
         "abbreviations": ABBREVIATIONS, "difficulty_order": DIFFICULTY_ORDER,
         "script_md5": hashlib.md5(Path(__file__).read_bytes()).hexdigest(),
     }
@@ -891,8 +897,8 @@ def find_line_links(geom: np.ndarray, geom_m: np.ndarray, kinds: list, keys: lis
         * Lifts must meet end to end; a lift touching another mid-way doesn't link.
         * A line drawn twice is a copy (see COPY_WITHIN_M). The shorter one is recorded
           in copy_of; it still links, so its tags are merged.
-        * Two lifts meeting at both ends with similar lengths are twin lifts side by side
-          (see TWIN_LENGTH_RATIO) and don't link.
+        * Two lifts of similar length running alongside each other are twin lifts side by
+          side (see TWIN_LENGTH_RATIO) and don't link.
         * Where a linked line end doesn't already touch the other line, a straight
           connector is made to close the gap.
 
@@ -964,19 +970,20 @@ def find_line_links(geom: np.ndarray, geom_m: np.ndarray, kinds: list, keys: lis
         if inside >= COPY_SHARE * max(lo, 1e-9):
             out.copy_of[int(oo)] = int(tt_)
 
-    # Twin lifts: two lifts meeting at both ends with similar lengths are two lifts side by side.
+    # Twin lifts: two lifts of similar length running alongside each other are two lifts side
+    # by side, even when they were drawn in opposite directions and only one pair of ends meets.
     twins = set()
     lift_rows = L[e2e[L.o.to_numpy()]]
     for a, b in set(zip(np.minimum(lift_rows.o, lift_rows.t), np.maximum(lift_rows.o, lift_rows.t))):
         if a in out.copy_of or b in out.copy_of:
             continue
-        sa, ea = shapely.get_point(geom_m[a], 0), shapely.get_point(geom_m[a], -1)
-        sb, eb = shapely.get_point(geom_m[b], 0), shapely.get_point(geom_m[b], -1)
-        both = min(max(sa.distance(sb), ea.distance(eb)), max(sa.distance(eb), ea.distance(sb)))
-        if both <= LINE_GAP_M and min(lengths[a], lengths[b]) >= TWIN_LENGTH_RATIO * max(lengths[a], lengths[b]):
+        if min(lengths[a], lengths[b]) < TWIN_LENGTH_RATIO * max(lengths[a], lengths[b]):
+            continue
+        apart = runs_alongside(geom_m[a], geom_m[b])
+        if apart is not None:
             twins.add((int(a), int(b)))
             if collect_near:
-                out.near.append(NearMiss("twin lifts", int(a), int(b), float(both)))
+                out.near.append(NearMiss("twin lifts", int(a), int(b), float(apart)))
     if twins:
         pair = list(zip(np.minimum(L.o, L.t), np.maximum(L.o, L.t)))
         L = L[[pq not in twins for pq in pair]]
@@ -1005,6 +1012,33 @@ def find_line_links(geom: np.ndarray, geom_m: np.ndarray, kinds: list, keys: lis
                 seen.add(key)
                 out.connectors.append((int(oo), line))
     return out
+
+
+def runs_alongside(a, b) -> float | None:
+    """Check whether the shorter of two lines runs alongside the longer one.
+
+    Both ends of the shorter line must lie within TWIN_APART_M of the longer line, and the
+    stretch of the longer line between the points nearest those ends must be at least
+    TWIN_OVERLAP_SHARE of the shorter line's length. Two sections of one lift fail this:
+    the far end of one lies away from the other.
+
+    Args:
+        a: The first line, in METRIC_CRS (metres).
+        b: The second line, in METRIC_CRS (metres).
+
+    Returns:
+        How far apart the two lines run, in metres (the larger distance from an end of the
+        shorter line to the longer line), or None if they don't run alongside each other.
+    """
+    long, short = (a, b) if a.length >= b.length else (b, a)
+    if short.length == 0:
+        return None
+    s, e = shapely.get_point(short, 0), shapely.get_point(short, -1)
+    apart = max(long.distance(s), long.distance(e))
+    if apart > TWIN_APART_M:
+        return None
+    overlap = abs(shapely.line_locate_point(long, s) - shapely.line_locate_point(long, e))
+    return float(apart) if overlap >= TWIN_OVERLAP_SHARE * short.length else None
 
 
 def find_area_links(geom_m: np.ndarray, kinds: list, keys: list, collect_near: bool = False) -> Links:

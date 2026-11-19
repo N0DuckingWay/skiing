@@ -149,7 +149,7 @@ New columns on every layer except `points` (empty on untouched rows):
 - **They touch.** For lines, an end of one is within 15 m of the other, or the gap is closed with a short straight connector. For polygons, they are within 5 m or overlap.
 - **Same kind of feature:**
   - Ski pistes need a ski type in common (`nordic` merges with `nordic;hike`; downhill never merges with nordic).
-  - Lifts need the same `aerialway` value and must meet end to end. A lift never merges with its station. Two lifts side by side that meet at both ends with similar lengths (twin rope tows, dual zip lines) stay separate.
+  - Lifts need the same `aerialway` value and must meet end to end. A lift never merges with its station. Two lifts of similar length (within 80%) that run side by side, no more than 30 m apart, stay separate: twin rope tows, dual zip lines, or the two cables of a tram drawn in opposite directions, where only one pair of ends meets (the Sandia Peak Aerial Tramway).
   - Streams, rivers and flowlines (a river's path through a lake) merge with each other; other waterways need the same value.
   - Woods and forests (`natural=wood`, `landuse=forest`, tree landcover) merge with each other, as do grass, meadow and grassland. A merged polygon keeps every tag its pieces had.
   - Everything else needs the same main tag (`natural=cliff` with `natural=cliff`, …).

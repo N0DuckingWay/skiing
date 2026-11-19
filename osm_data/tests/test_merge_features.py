@@ -229,6 +229,25 @@ def test_twin_lifts_stay_apart():
     assert [n.reason for n in links.near] == ["twin lifts"]
 
 
+def test_twin_lifts_drawn_in_opposite_directions_stay_apart():
+    """Like the Sandia Peak Tramway: two cables 10-16 m apart, drawn in opposite directions.
+
+    Only one pair of ends is within LINE_GAP_M, so the two used to join into one U-shaped lift.
+    """
+    tram = {"aerialway": "cable_car"}
+    links, _ = links_for([[(0, 0), (1000, 0)], [(1000, -16), (0, -10)]], ["Peak Tramway"] * 2, [tram] * 2)
+    assert edges(links) == []
+    assert [n.reason for n in links.near] == ["twin lifts"]
+
+
+def test_runs_alongside():
+    """Side-by-side lines run alongside; sections in a row and a short spur don't."""
+    line = shapely.LineString([(0, 0), (1000, 0)])
+    assert mf.runs_alongside(line, shapely.LineString([(1000, 9), (0, 9)])) == pytest.approx(9)
+    assert mf.runs_alongside(line, shapely.LineString([(1000, 0), (1700, 300)])) is None
+    assert mf.runs_alongside(line, shapely.LineString([(500, 0), (500, 400)])) is None
+
+
 def test_lift_sections_join_end_to_end_but_not_mid_way():
     """Gondola sections meeting end to end link; chairs touching mid-way don't."""
     gondola = {"aerialway": "gondola"}
