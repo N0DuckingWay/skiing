@@ -14,7 +14,8 @@ and writes, under <data-dir>/out/:
     ski_nature_merged.json    inputs, rules hash and counts
     merge_groups.csv          one row per merged feature, with openstreetmap.org links
     merge_pieces.csv          one row per source object that went into a merged feature
-    merge_near_misses.csv     touching pairs that were not merged, and why
+    merge_near_misses.csv     touching pairs that were not merged, and why, plus merged
+                              pieces drawn side by side ("drawn twice?")
     merge_review.html         the groups and near misses as a filterable page
 
 Rules (details in osm_data/README.md):
@@ -111,9 +112,11 @@ POLY_GAP_M = 5.0
 # A line end closer than this (metres) to the line it links to already touches it (they
 # share an OSM node), so no connector is drawn between them.
 SHARED_NODE_M = 0.05
-# A line is a copy of another (the same run drawn twice) when both its ends, and at least
-# COPY_SHARE of its length, lie within COPY_WITHIN_M metres of the other line. The copy's
-# tags are merged but its geometry is dropped.
+# A line is a copy of another (the same run drawn twice) when at least COPY_SHARE of its
+# length lies within COPY_WITHIN_M metres of the other line, and either both its ends do
+# too, or one does and it runs along the other line for COPY_SHARE of its length. The second
+# case is a run redrawn with a different end; a short line that just leads away from the
+# other's end doesn't count. The copy's tags are merged but its geometry is dropped.
 COPY_WITHIN_M = 3.0
 COPY_SHARE = 0.9
 # Two linked lifts are twin lifts side by side (two separate lifts, not two sections of one)
@@ -208,6 +211,10 @@ PROVENANCE_COLUMNS = [("merge_group", "TEXT"), ("merged_ids", "TEXT"), ("merged_
                       ("merge_match", "TEXT"), ("merge_conflicts", "TEXT")]
 # Near-miss codes returned by compare_pairs, and the reason each one stands for.
 NEAR_REASONS = {1: "qualifier differs", 2: "name too different"}
+# Reason for two pieces of one merged line that run side by side without being a copy (see
+# find_line_links). They may be one feature drawn twice, so they are listed with the near
+# misses for review, but both are kept.
+DRAWN_TWICE = "drawn twice?"
 
 
 def rules() -> dict:
@@ -765,7 +772,8 @@ class NearMiss:
 
     Attributes:
         reason: Why they were kept apart: "qualifier differs", "name too different",
-            "different kind", "lifts touch mid-way" or "twin lifts".
+            "different kind", "lifts touch mid-way" or "twin lifts". DRAWN_TWICE marks two
+            pieces of one merged line that run side by side, listed for review.
         a: Node index of the first feature (its position in the arrays passed to
             find_line_links or find_area_links).
         b: Node index of the second feature.
@@ -905,6 +913,8 @@ def find_line_links(geom: np.ndarray, geom_m: np.ndarray, kinds: list, keys: lis
         * Lifts must meet end to end; a lift touching another mid-way doesn't link.
         * A line drawn twice is a copy (see COPY_WITHIN_M). The shorter one is recorded
           in copy_of; it still links, so its tags are merged.
+        * Two linked lines that run side by side but aren't a copy are kept, and listed
+          as DRAWN_TWICE near misses for review.
         * Two lifts of similar length running alongside each other are twin lifts side by
           side (see TWIN_LENGTH_RATIO) and don't link.
         * Where a linked line end doesn't already touch the other line, a straight
@@ -917,8 +927,8 @@ def find_line_links(geom: np.ndarray, geom_m: np.ndarray, kinds: list, keys: lis
         keys: NameKey of every node, or None if it has no name. Unnamed lines never link.
         lengths: Length of every line in metres on the ground (see ground_length). Only
             named nodes are used.
-        collect_near: Also record touching pairs that didn't link, for the review file.
-            The self-checks leave this off.
+        collect_near: Also record touching pairs that didn't link, and DRAWN_TWICE
+            pairs, for the review file. The self-checks leave this off.
 
     Returns:
         The links found. Each pair of nodes appears at most once, with a < b and the
@@ -975,19 +985,34 @@ def find_line_links(geom: np.ndarray, geom_m: np.ndarray, kinds: list, keys: lis
         out.near.extend(near_misses_from(nr[nr.reason.notna()], "reason"))
     L = rows[rows.link]
 
-    # Copies: both ends of the shorter line close to the other, and most of it alongside.
-    close = L[L.d <= COPY_WITHIN_M]
-    both_ends = close.groupby(["o", "t"])["end"].nunique()
-    for oo, tt_ in both_ends[both_ends == 2].index:
-        lo, lt = lengths[oo], lengths[tt_]
-        if lo > lt or (lo == lt and oo < tt_) or oo in out.copy_of:
+    # Copies: an end of the shorter line close to the other, and most of it alongside (see
+    # COPY_WITHIN_M). The zone alongside is COPY_WITHIN_M wide on the ground, plus 0.5 m of
+    # slack.
+    width = COPY_WITHIN_M + 0.5
+    cand = L.loc[L.d <= COPY_WITHIN_M, ["o", "t"]].drop_duplicates().sort_values(["o", "t"])
+    co, ct = cand.o.to_numpy(), cand.t.to_numpy()
+    shorter = (lengths[co] < lengths[ct]) | ((lengths[co] == lengths[ct]) & (co > ct))
+    co, ct = co[shorter], ct[shorter]
+    # Quick test first: the part of a copy outside the zone is at least as long as its far
+    # end lies beyond the zone, which rules out lines that lead away (most links).
+    far = np.maximum(ground_distance(shapely.get_point(geom_m[co], 0), geom_m[ct]),
+                     ground_distance(shapely.get_point(geom_m[co], -1), geom_m[ct]))
+    may = far - width <= (1 - COPY_SHARE) * lengths[co]
+    for oo, tt_, far_ in zip(co[may], ct[may], far[may]):
+        if oo in out.copy_of:
             continue
-        # The share is measured in METRIC_CRS, with the buffer widened to COPY_WITHIN_M on
-        # the ground (plus 0.5 m of slack). Both lengths scale alike, so the share is true.
-        zone = shapely.buffer(geom_m[tt_], (COPY_WITHIN_M + 0.5) * scale[tt_])
-        inside = shapely.length(shapely.intersection(geom_m[oo], zone))
-        if inside >= COPY_SHARE * max(shapely.length(geom_m[oo]), 1e-9):
-            out.copy_of[int(oo)] = int(tt_)
+        # The shares are measured in METRIC_CRS. Both lengths scale alike, so they are true.
+        own = max(shapely.length(geom_m[oo]), 1e-9)
+        zone = shapely.buffer(geom_m[tt_], width * scale[tt_])
+        if shapely.length(shapely.intersection(geom_m[oo], zone)) < COPY_SHARE * own:
+            continue
+        if far_ > COPY_WITHIN_M:        # one end strays: it must run along the other line
+            ends = [shapely.get_point(geom_m[oo], i) for i in (0, -1)]
+            along = abs(shapely.line_locate_point(geom_m[tt_], ends[0])
+                        - shapely.line_locate_point(geom_m[tt_], ends[1]))
+            if along < COPY_SHARE * own:
+                continue
+        out.copy_of[int(oo)] = int(tt_)
 
     # Twin lifts: two lifts of similar length running alongside each other are two lifts side
     # by side, even when they were drawn in opposite directions and only one pair of ends meets.
@@ -1006,6 +1031,34 @@ def find_line_links(geom: np.ndarray, geom_m: np.ndarray, kinds: list, keys: lis
     if twins:
         pair = list(zip(np.minimum(L.o, L.t), np.maximum(L.o, L.t)))
         L = L[[pq not in twins for pq in pair]]
+
+    # Linked lines that run side by side without being a copy: one feature drawn twice (by
+    # two mappers, or an import beside a newer drawing), or two real ones (tubing lanes, twin
+    # culverts, one-way ski tracks). Their shapes don't tell which, so both are kept and the
+    # pair is listed for review. Side by side means the shorter line runs along the longer
+    # one, and lies within LINE_GAP_M of it, for TWIN_OVERLAP_SHARE of its length. A line
+    # with both ends within COPY_WITHIN_M of the other leaves it and rejoins it (around an
+    # island or trees), so it isn't listed.
+    if collect_near and not L.empty:
+        pairs = pd.DataFrame({"a": np.minimum(L.o, L.t), "b": np.maximum(L.o, L.t)}).drop_duplicates()
+        pairs = pairs[~pairs.a.isin(list(out.copy_of)) & ~pairs.b.isin(list(out.copy_of))]
+        a_, b_ = pairs.a.to_numpy(), pairs.b.to_numpy()
+        s_ = np.where(lengths[a_] <= lengths[b_], a_, b_)
+        l_ = np.where(lengths[a_] <= lengths[b_], b_, a_)
+        # Shares are measured in METRIC_CRS, where both lengths scale alike.
+        ss, ll, own = geom_m[s_], geom_m[l_], shapely.length(geom_m[s_])
+        s0, s1 = shapely.get_point(ss, 0), shapely.get_point(ss, -1)
+        along = np.abs(shapely.line_locate_point(ll, s0) - shapely.line_locate_point(ll, s1))
+        k = np.flatnonzero(along >= TWIN_OVERLAP_SHARE * own)
+        ss, ll, own, s0, s1 = ss[k], ll[k], own[k], s0[k], s1[k]
+        nearby = shapely.length(shapely.intersection(ss, shapely.buffer(ll, LINE_GAP_M * scale[l_[k]])))
+        rejoins = np.maximum(ground_distance(s0, ll), ground_distance(s1, ll)) <= COPY_WITHIN_M
+        listed = (nearby >= TWIN_OVERLAP_SHARE * own) & ~rejoins
+        # How far apart they run, measured at the middle of the shorter line.
+        middle = shapely.line_interpolate_point(ss[listed], 0.5, normalized=True)
+        apart = ground_distance(middle, ll[listed])
+        for x, y, d_ in zip(s_[k][listed], l_[k][listed], apart):
+            out.near.append(NearMiss(DRAWN_TWICE, int(min(x, y)), int(max(x, y)), float(d_)))
 
     edges = (L.assign(a=np.minimum(L.o, L.t), b=np.maximum(L.o, L.t))
              .groupby(["a", "b"], as_index=False)["d"].min())
@@ -1517,11 +1570,13 @@ def near_row(reason: str, layer: str, a: dict, b: dict, distance: float, geom) -
     """Build one row of merge_near_misses.csv.
 
     Args:
-        reason: Why the two features weren't merged (see NearMiss.reason).
+        reason: Why the two features weren't merged, or DRAWN_TWICE (see
+            NearMiss.reason).
         layer: The layer they are in.
         a: The first feature, as a dict with keys osm_type, osm_id, name and kind.
         b: The second feature, with the same keys.
-        distance: The distance between them, in metres.
+        distance: The distance between them, in metres (for DRAWN_TWICE, how far apart
+            they run at the middle of the shorter one).
         geom: Geometry (EPSG:4326) for the map link to show.
 
     Returns:
@@ -2303,7 +2358,8 @@ def write_review(out: Path, result: Result, snapshot: str | None) -> dict:
     """Write the review files: three CSV files and merge_review.html.
 
     The CSV files are merge_groups.csv (one row per merged feature), merge_pieces.csv (one
-    row per source object) and merge_near_misses.csv (touching pairs that weren't merged).
+    row per source object) and merge_near_misses.csv (touching pairs that weren't merged,
+    and merged pieces drawn side by side).
     The HTML page shows the groups and near misses with filters.
 
     Args:
@@ -2374,7 +2430,10 @@ def print_report(result: Result) -> None:
         print(f"{kind[:44]:<44} {c['groups']:>8,} {c['pieces']:>9,} {c['fuzzy']:>7,} {c['inherited']:>8,} "
               f"{c['with_conflicts']:>9,} {c['relations_absorbed']:>6,}")
     print(f"\ntotal: {len(result.groups):,} merged features from {sum(len(g.pieces) for g in result.groups):,} pieces")
-    print("near misses (touching, not merged):", ", ".join(f"{k} {v:,}" for k, v in s["near_misses"].items()))
+    near = dict(s["near_misses"])
+    twice = near.pop(DRAWN_TWICE, 0)
+    print("near misses (touching, not merged):", ", ".join(f"{k} {v:,}" for k, v in near.items()))
+    print(f"merged pieces drawn side by side, listed as {DRAWN_TWICE!r} for review: {twice:,}")
     for f in result.failures:
         print("SELF-CHECK FAILED:", f)
 

@@ -129,7 +129,7 @@ python osm_data/merge_features.py --data-dir "/Users/zdhoffman/Coding Projects/S
 | `ski_nature_merged.json` | Inputs, a hash of the rules, and counts per layer and per kind of feature. |
 | `merge_groups.csv` | One row per merged feature (the "after"): its row in the output, the OSM objects it came from with openstreetmap.org links, a map link, names and difficulty before and after, and every attribute conflict with how it was resolved. |
 | `merge_pieces.csv` | One row per source object (the "before"): OSM link, its fid in `ski_nature.gpkg`, name, kind and key tags, and its role (`representative`, `merged`, `name inherited`, `copy dropped`, `relation absorbed`). |
-| `merge_near_misses.csv` | Pairs that touch but were *not* merged, with the reason (`qualifier differs`, `name too different`, `different kind`, `twin lifts`, `lifts touch mid-way`, `relation kept`). Use it to check nothing was missed. |
+| `merge_near_misses.csv` | Pairs that touch but were *not* merged, with the reason (`qualifier differs`, `name too different`, `different kind`, `twin lifts`, `lifts touch mid-way`, `relation kept`). Use it to check nothing was missed. It also lists merged pieces that run side by side (`drawn twice?`, see below). |
 | `merge_review.html` | The groups and near misses as one page you can filter, with clickable links. Open it in a browser. |
 
 All links point at the objects as they were in the OSM snapshot. If an object changed since then, the History tab on its openstreetmap.org page shows the version used.
@@ -166,7 +166,11 @@ New columns on every layer except `points` (empty on untouched rows):
 - Any other disagreement goes to the longest (or largest) piece.
 - A tag only some pieces have is kept.
 
-**Not changed:** points, run areas vs. run lines (they're left as separate features), and a line drawn twice is kept once ("copy dropped").
+**Not changed:** points, and run areas vs. run lines (they're left as separate features).
+
+**Lines drawn twice:**
+- A line that lies within 3 m of another for 90% of its length is a copy: its tags are merged, but only the longer drawing is kept ("copy dropped"). Either both its ends are within 3 m too, or one is and it runs along the other line, as where a run was redrawn with a different end (Upper Buzzsaw).
+- Pieces of one feature that run side by side further apart (80% of the shorter within 15 m, without rejoining) are both kept, and the pair is listed in `merge_near_misses.csv` as `drawn twice?`. Some are one thing drawn twice, such as a resort redrawn without deleting the old runs, or an imported creek beside a newer drawing. Others are real, such as tubing lanes, twin culverts and one-way ski tracks. Their shapes don't tell which, so fix the first kind in OSM itself. Until then, the merged length counts both drawings.
 
 **Self-checks** (the script stops without writing if one fails):
 - Merged lengths equal the pieces plus connectors, and merged areas lie between the largest piece and the sum of the pieces.

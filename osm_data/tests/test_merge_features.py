@@ -293,6 +293,47 @@ def test_line_drawn_twice_is_a_copy():
     assert links.copy_of == {1: 0}
 
 
+def test_redrawn_run_with_a_different_end_is_a_copy():
+    """Like Upper Buzzsaw: an old drawing 1.5 m beside the new one, whose end strays 20 m.
+
+    The copy rule used to need both ends within COPY_WITHIN_M, so both drawings were kept.
+    """
+    links, _ = links_for([[(0, 0), (800, 0)], [(0, 1.5), (360, 1.5), (388, 20)]], ["Upper Buzzsaw"] * 2,
+                         [DOWNHILL] * 2)
+    assert links.copy_of == {1: 0} and links.near == []
+
+
+def test_short_line_leading_away_is_not_a_copy():
+    """A 3.8 m piece continuing from a line's end is 90% within 3.5 m of it, but no copy."""
+    links, _ = links_for([[(0, 0), (100, 0)], [(100, 0), (103.8, 0)]], ["Culvert Creek"] * 2,
+                         [{"waterway": "stream"}] * 2)
+    assert edges(links) == [(0, 1)] and links.copy_of == {}
+
+
+def test_side_by_side_lines_are_kept_and_listed_for_review():
+    """Two tubing lanes 8 m apart merge, both drawings stay, and the pair is listed."""
+    sled = {"piste:type": "sled"}
+    links, _ = links_for([[(0, 0), (200, 0)], [(0, 8), (200, 8)]], ["Tube Run"] * 2, [sled] * 2)
+    assert edges(links) == [(0, 1)] and links.copy_of == {}
+    assert [(n.reason, n.a, n.b) for n in links.near] == [(mf.DRAWN_TWICE, 0, 1)]
+    assert links.near[0].distance == pytest.approx(8, abs=0.01)
+
+
+def test_redrawn_run_with_a_stray_end_is_listed_for_review():
+    """Like Double Bucker: an old drawing 4 m beside the new one, whose end strays 30 m."""
+    links, _ = links_for([[(0, 0), (800, 0)], [(0, 4), (360, 4), (380, 30)]], ["Double Bucker"] * 2,
+                         [DOWNHILL] * 2)
+    assert links.copy_of == {} and [(n.reason, n.a, n.b) for n in links.near] == [(mf.DRAWN_TWICE, 0, 1)]
+    assert links.near[0].distance == pytest.approx(4, abs=0.01)
+
+
+def test_run_that_splits_and_rejoins_is_not_listed():
+    """A run that leaves the main line around trees and rejoins it isn't drawn twice."""
+    links, _ = links_for([[(0, 0), (300, 0)], [(100, 0), (150, 6), (200, 6), (250, 0)]], ["Glades"] * 2,
+                         [DOWNHILL] * 2)
+    assert edges(links) == [(0, 1)] and links.copy_of == {} and links.near == []
+
+
 def test_twin_lifts_stay_apart():
     """Two same-length rope tows 8 m apart are two lifts, not one."""
     tow = {"aerialway": "rope_tow"}
