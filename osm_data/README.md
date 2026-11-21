@@ -151,12 +151,12 @@ New columns on every layer except `points` (empty on untouched rows):
 - **Same kind of feature:**
   - Ski pistes need a ski type in common (`nordic` merges with `nordic;hike`; downhill never merges with nordic).
   - Lifts need the same `aerialway` value and must meet end to end. A lift never merges with its station. Two lifts of similar length (within 80%) that run side by side, no more than 30 m apart, stay separate: twin rope tows, dual zip lines, or the two cables of a tram drawn in opposite directions, where only one pair of ends meets (the Sandia Peak Aerial Tramway).
-  - Streams, rivers and flowlines (a river's path through a lake) merge with each other; other waterways need the same value.
+  - Streams, rivers and flowlines (a river's path through a lake) merge with each other; other waterways need the same value. Waterfalls always stay separate, even when they are part of a river's relation.
   - Woods and forests (`natural=wood`, `landuse=forest`, tree landcover) merge with each other, as do grass, meadow and grassland. A merged polygon keeps every tag its pieces had.
   - Everything else needs the same main tag (`natural=cliff` with `natural=cliff`, …).
 - **Unnamed features are never merged**, with one exception: an unnamed way in exactly one named route or waterway relation takes that relation's name.
 
-**Relations.** If every way of a route or waterway relation that is in the `lines` layer carries the relation's name, the relation and those ways are the same feature. They become one row in `lines`, and the relation's ways that aren't in `lines` (untagged ways, or ways just past the 10-mile zone) are added to its geometry. Relations whose ways carry other names stay as they are: for example nordic loops built from shared, separately named trails. Leftover route relations with the same name that touch are merged with each other.
+**Relations.** If every way of a route or waterway relation that is in the `lines` layer carries the relation's name, the relation and those ways are the same feature. They become one row in `lines`, and the relation's ways that aren't in `lines` (untagged ways, or ways past the 10-mile zone) are added to its geometry, so a long river keeps its whole length. A waterway relation also takes in canal and ditch ways that carry its name, but a waterfall stays a feature of its own. Relations whose ways carry other names stay as they are: for example nordic loops built from shared, separately named trails. Leftover route relations with the same name that touch are merged with each other.
 
 **Combining attributes:**
 - The hardest `piste:difficulty` wins: novice < easy < intermediate < advanced < expert < freeride < extreme.

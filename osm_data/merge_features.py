@@ -28,7 +28,7 @@ Rules (details in osm_data/README.md):
                Polygons: within 5 m.
     kind       only the same kind of feature merges (downhill with downhill, a lift with
                the same lift type, stream with river, woods with forest, grass with
-               meadow, ...).
+               meadow, ...). Waterfalls stay separate, even inside a river's relation.
     relations  an unnamed way in exactly one named route/waterway relation takes its name.
                A relation whose ways in the lines layer all carry its name is the same
                feature as those ways and is merged into them.
@@ -186,6 +186,11 @@ NON_SKI = frozenset(NON_SKI_PISTE_TYPES)
 TRAIL_HIGHWAYS = frozenset(SKI_TRAIL_HIGHWAYS)
 # One watercourse: a creek can become a river, and a flowline is the river's path through a lake.
 STREAM_RIVER = frozenset({"stream", "river", "flowline"})
+# waterway values that stay features of their own even when a waterway relation includes
+# them: a waterfall on a river keeps its own tags instead of becoming part of the river.
+SEPARATE_WATERWAYS = frozenset({"waterfall"})
+# The line_kind families of SEPARATE_WATERWAYS.
+SEPARATE_FAMILIES = frozenset(f"waterway:{w}" for w in SEPARATE_WATERWAYS)
 # landuse values for grass. They merge with each other and with natural=grassland.
 GRASS_LANDUSE = frozenset({"grass", "meadow"})
 # Tags that give the kind of any other line, checked in this order (the first one the line
@@ -233,6 +238,7 @@ def rules() -> dict:
         "twin_length_ratio": TWIN_LENGTH_RATIO, "twin_apart_m": TWIN_APART_M,
         "twin_overlap_share": TWIN_OVERLAP_SHARE, "qualifiers": sorted(QUALIFIER_WORDS),
         "abbreviations": ABBREVIATIONS, "difficulty_order": DIFFICULTY_ORDER,
+        "separate_waterways": sorted(SEPARATE_WATERWAYS),
         "script_md5": hashlib.md5(Path(__file__).read_bytes()).hexdigest(),
     }
 
@@ -551,6 +557,22 @@ def relation_accepts(rel: Kind, way: Kind) -> bool:
     if rel.family == "rel:trail":
         return way.family in ("trail", "piste")
     return True
+
+
+def relation_pieces(ways: list[int], kinds: list) -> list[int]:
+    """Pick the member ways that are pieces of a relation's feature.
+
+    Ways whose waterway value is in SEPARATE_WATERWAYS stay features of their own. A river
+    relation is still absorbed into its other ways, and its waterfall is left as it is.
+
+    Args:
+        ways: Node indexes (row positions in the lines layer) of the relation's member ways.
+        kinds: Kind of every node (see line_kind).
+
+    Returns:
+        The indexes of the ways that are pieces, in the same order.
+    """
+    return [i for i in ways if kinds[i].family not in SEPARATE_FAMILIES]
 
 
 def end_to_end_only(kind: Kind) -> bool:
@@ -1644,7 +1666,7 @@ def merge_line_features(src: Path, pbf: Path, result: Result) -> None:
     relations = read_relations(src)
     members = read_relation_members(pbf, {r.osm_id for r in relations})
     for r in relations:
-        r.members = [way_index[w] for w in members.get(r.osm_id, []) if w in way_index]
+        r.members = relation_pieces([way_index[w] for w in members.get(r.osm_id, []) if w in way_index], kinds)
     log.info("relations: %d route/waterway relations, %d with member ways in lines",
              len(relations), sum(bool(r.members) for r in relations))
 
@@ -1691,8 +1713,9 @@ def merge_line_features(src: Path, pbf: Path, result: Result) -> None:
         for i in r.members:
             link_kinds[i] = rel_kind[id(r)]
 
-    # Parts of an absorbed relation that aren't ways in lines (untagged ways, or ways just
-    # outside the 10-mile zone) become extra nodes, so they can link like any other piece.
+    # Parts of an absorbed relation that aren't ways in lines (untagged ways, ways outside the
+    # 10-mile zone, or a waterfall left out by relation_pieces) become extra nodes, so they
+    # can link like any other piece. A long river keeps its whole length this way.
     v_geom, v_kind, v_key, v_rel = [], [], [], []
     for r in absorbed:
         covered = set()

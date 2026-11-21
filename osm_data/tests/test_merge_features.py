@@ -156,6 +156,12 @@ def test_relation_accepts():
     assert not mf.relation_accepts(river, mf.line_kind({"piste:type": "nordic"}))
 
 
+def test_waterfalls_are_not_pieces_of_their_relation():
+    kinds = [mf.line_kind({"waterway": "river"}), mf.line_kind({"waterway": "waterfall"}),
+             mf.line_kind({"waterway": "canal"})]
+    assert mf.relation_pieces([0, 1, 2], kinds) == [0, 2]
+
+
 # ---------------------------------------------------------------- linking (coordinates in metres)
 
 # Test geometry is drawn in metres east (x) and north (y) of a point in Colorado, then
