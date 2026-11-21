@@ -8,7 +8,7 @@ Two scripts turn free OpenStreetMap data for the US and Canada into:
 These are already in the `coding-projects` conda env:
 - **osmium-tool:** command-line tool for filtering raw OSM files (`brew install osmium-tool`).
 - **GDAL:** converts map file formats; its `ogr2ogr` command writes the GeoPackage layers.
-- **Python packages:** geopandas, shapely, pyogrio.
+- **Python packages:** geopandas, shapely, pyogrio; `merge_features.py` also uses pyosmium, scipy and rapidfuzz, and its tests use pytest.
 
 ## Run it
 Keep the data in the main checkout, not in a git worktree, so it survives worktree cleanup:
@@ -115,6 +115,72 @@ Not counted as lifts:
 **Safe to rerun:** it rebuilds only when `features_near_runs.gpkg` is newer than the output or the rules have changed. `--force` rebuilds anyway.
 
 **Checking rule changes:** `--report` prints how many features each rule matches, per layer, without writing anything.
+
+## Cleaning: merge split features
+`merge_features.py` is the second cleaning step. OSM often stores one real thing as several objects: a run cut into pieces where it crosses a lift, a gondola drawn as two sections, a river cut into hundreds of ways, or a piste route relation drawn on top of its own ways. This step joins them into one feature, matching on **name + location**. It reads `ski_nature.gpkg`, plus `near_runs.osm.pbf` for relation member lists (the GeoPackage doesn't keep them). Neither input is changed.
+
+```bash
+python osm_data/merge_features.py --data-dir "/Users/zdhoffman/Coding Projects/Skiing App/osm_data/data"
+```
+
+| File | Contents |
+|---|---|
+| `ski_nature_merged.gpkg` | Same layers and columns as `ski_nature.gpkg`; each merged feature is one row. Untouched rows keep their fid. |
+| `ski_nature_merged.json` | Inputs, a hash of the rules, and counts per layer and per kind of feature. |
+| `merge_groups.csv` | One row per merged feature (the "after"): its row in the output, the OSM objects it came from with openstreetmap.org links, a map link, names and difficulty before and after, and every attribute conflict with how it was resolved. |
+| `merge_pieces.csv` | One row per source object (the "before"): OSM link, its fid in `ski_nature.gpkg`, name, kind and key tags, and its role (`representative`, `merged`, `name inherited`, `copy dropped`, `relation absorbed`). |
+| `merge_near_misses.csv` | Pairs that touch but were *not* merged, with the reason (`qualifier differs`, `name too different`, `different kind`, `twin lifts`, `lifts touch mid-way`, `relation kept`). Use it to check nothing was missed. It also lists merged pieces that run side by side (`drawn twice?`, see below). |
+| `merge_review.html` | The groups and near misses as one page you can filter, with clickable links. Open it in a browser. |
+
+All links point at the objects as they were in the OSM snapshot. If an object changed since then, the History tab on its openstreetmap.org page shows the version used.
+
+New columns on every layer except `points` (empty on untouched rows):
+- `merge_group`: joins to `merge_groups.csv`.
+- `merged_ids`: the source objects, e.g. `w123;w456;r789` (w = way, r = relation). The first is the one whose id the row keeps in `osm_id` / `osm_way_id`: the longest (or largest) piece.
+- `merged_count`, `merge_match` (`exact`, `fuzzy` or `inherited`), `merge_conflicts` (JSON: each conflicting tag's values and the one chosen).
+
+**The `lines` layer now holds both LineStrings and MultiLineStrings.** A run that forks, splits around trees and rejoins, or has a piece joining mid-run becomes one MultiLineString feature.
+
+**When two features merge.** All of these must hold:
+- **Names match.** Names are compared after normalizing accents, case, punctuation, spacing and possessives ("Cassidy's Traverse" = "Cassidy Traverse", "Bear Claw" = "Bearclaw"), and after expanding abbreviations ("U. Cruiser" = "Upper Cruiser").
+  - Small misspellings are allowed: one letter in names of 8+ letters, two in names of 16+ ("Winnisook" = "Winisook").
+  - Qualifier words must be the same: upper/lower/middle, north/south/east/west (and French equivalents), numbers, single letters and roman numerals. So "Upper White Lightning" ≠ "Lower White Lightning" and "Gondola I" ≠ "Gondola II".
+  - `piste:name` is used when there is no `name`.
+- **They touch.** For lines, an end of one is within 15 m of the other; any gap is closed with a short straight connector. For polygons, they are within 5 m or overlap.
+  - Distances and lengths are measured on the ground (on the WGS84 ellipsoid), so 15 m is 15 m everywhere. A single map projection of North America would be off by up to 6% in the contiguous US, and more in the far north.
+- **Same kind of feature:**
+  - Ski pistes need a ski type in common (`nordic` merges with `nordic;hike`; downhill never merges with nordic).
+  - Lifts need the same `aerialway` value and must meet end to end. A lift never merges with its station. Two lifts of similar length (within 80%) that run side by side, no more than 30 m apart, stay separate: twin rope tows, dual zip lines, or the two cables of a tram drawn in opposite directions, where only one pair of ends meets (the Sandia Peak Aerial Tramway).
+  - Streams, rivers and flowlines (a river's path through a lake) merge with each other; other waterways need the same value. Waterfalls always stay separate, even when they are part of a river's relation.
+  - Woods and forests (`natural=wood`, `landuse=forest`, tree landcover) merge with each other, as do grass, meadow and grassland. A merged polygon keeps every tag its pieces had.
+  - Everything else needs the same main tag (`natural=cliff` with `natural=cliff`, …).
+- **Unnamed features are never merged**, with one exception: an unnamed way in exactly one named route or waterway relation takes that relation's name.
+
+**Relations.** If every way of a route or waterway relation that is in the `lines` layer carries the relation's name, the relation and those ways are the same feature. They become one row in `lines`, and the relation's ways that aren't in `lines` (untagged ways, or ways past the 10-mile zone) are added to its geometry, so a long river keeps its whole length. A waterway relation also takes in canal and ditch ways that carry its name, but a waterfall stays a feature of its own. Relations whose ways carry other names stay as they are: for example nordic loops built from shared, separately named trails. Leftover route relations with the same name that touch are merged with each other.
+
+**Combining attributes:**
+- The hardest `piste:difficulty` wins: novice < easy < intermediate < advanced < expert < freeride < extreme.
+- Multi-value tags (`piste:type`, `piste:grooming`, `ref`, …) are combined, e.g. `classic` + `skating` → `classic;skating`.
+- `gladed`, `lit` and `piste:snowmaking` are `yes` if any piece says yes.
+- The name is the spelling covering the most length.
+- Any other disagreement goes to the longest (or largest) piece.
+- A tag only some pieces have is kept.
+
+**Not changed:** points, and run areas vs. run lines (they're left as separate features).
+
+**Lines drawn twice:**
+- A line that lies within 3 m of another for 90% of its length is a copy: its tags are merged, but only the longer drawing is kept ("copy dropped"). Either both its ends are within 3 m too, or one is and it runs along the other line, as where a run was redrawn with a different end (Upper Buzzsaw).
+- Pieces of one feature that run side by side further apart (80% of the shorter within 15 m, without rejoining) are both kept, and the pair is listed in `merge_near_misses.csv` as `drawn twice?`. Some are one thing drawn twice, such as a resort redrawn without deleting the old runs, or an imported creek beside a newer drawing. Others are real, such as tubing lanes, twin culverts and one-way ski tracks. Their shapes don't tell which, so fix the first kind in OSM itself. Until then, the merged length counts both drawings.
+
+**Self-checks** (the script stops without writing if one fails):
+- Merged lengths equal the pieces plus connectors, and merged areas lie between the largest piece and the sum of the pieces.
+- Every replaced row is in exactly one merged feature.
+- The row counts add up.
+- Running the matching again on the result finds nothing left to merge.
+
+**Safe to rerun:** it rebuilds only when an input is newer than the output or the script changed. `--force` rebuilds anyway, and `--report` prints what would be merged per kind of feature without writing anything.
+
+**Tests:** `python -m pytest osm_data/tests` checks the name matching, attribute rules and linking on small examples.
 
 ## How it works
 1. **Download** (`download_osm.py`):

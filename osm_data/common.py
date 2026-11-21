@@ -1,4 +1,4 @@
-"""Helpers shared by download_osm.py and filter_near_runs.py."""
+"""Helpers shared by the osm_data scripts."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 import logging
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -83,6 +84,58 @@ def write_json(path: Path, data: dict) -> None:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def connect_ro(gpkg: Path) -> sqlite3.Connection:
+    """Open a GeoPackage read-only with plain sqlite3.
+
+    Opening it read-only means a script can't change its input by mistake.
+
+    Args:
+        gpkg: Path to the .gpkg file.
+
+    Returns:
+        A read-only sqlite3 connection to the file.
+    """
+    return sqlite3.connect(gpkg.resolve().as_uri() + "?mode=ro", uri=True)
+
+
+def fid_range(gpkg: Path, layer: str) -> tuple[int | None, int | None]:
+    """Return the smallest and largest fid in a GeoPackage layer.
+
+    Args:
+        gpkg: Path to the .gpkg file.
+        layer: Name of the layer.
+
+    Returns:
+        A (min_fid, max_fid) tuple, or (None, None) if the layer has no rows.
+    """
+    with connect_ro(gpkg) as con:
+        return con.execute(f'SELECT MIN(fid), MAX(fid) FROM "{layer}"').fetchone()
+
+
+def polygonal(geom):
+    """Keep only the polygon parts of a geometry.
+
+    Collections are searched all the way down, so polygons inside a GeometryCollection are
+    found too. Points and lines are dropped.
+
+    Args:
+        geom: Any shapely geometry, such as the result of make_valid or union_all.
+
+    Returns:
+        The polygons as one MultiPolygon, or None if there are none.
+    """
+    import shapely
+
+    parts, todo = [], list(shapely.get_parts(geom))
+    while todo:
+        g = todo.pop()
+        if g.geom_type == "Polygon" and not g.is_empty:
+            parts.append(g)
+        elif g.geom_type in ("MultiPolygon", "GeometryCollection"):
+            todo.extend(shapely.get_parts(g))
+    return shapely.MultiPolygon(parts) if parts else None
 
 
 def human_size(n: float) -> str:
