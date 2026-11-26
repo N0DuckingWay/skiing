@@ -5,7 +5,7 @@ Two scripts turn free OpenStreetMap data for the US and Canada into:
 - every OSM feature of any type (land cover, water, lifts, roads, buildings, boundaries, …) with any part within 10 miles of a run.
 
 ## Requirements
-These are already in the `coding-projects` conda env:
+The local database also needs PostgreSQL and PostGIS (see "Local database"). The rest is already in the `coding-projects` conda env:
 - **osmium-tool:** command-line tool for filtering raw OSM files (`brew install osmium-tool`).
 - **GDAL:** converts map file formats; its `ogr2ogr` command writes the GeoPackage layers.
 - **Python packages:** geopandas, shapely, pyogrio; `merge_features.py` also uses pyosmium, scipy and rapidfuzz, and its tests use pytest.
@@ -181,6 +181,91 @@ New columns on every layer except `points` (empty on untouched rows):
 **Safe to rerun:** it rebuilds only when an input is newer than the output or the script changed. `--force` rebuilds anyway, and `--report` prints what would be merged per kind of feature without writing anything.
 
 **Tests:** `python -m pytest osm_data/tests` checks the name matching, attribute rules and linking on small examples.
+
+## Local database (PostGIS)
+`load_database.py` loads `ski_nature_merged.gpkg` into a local PostgreSQL database with the PostGIS extension, so the data can be queried with SQL. The GeoPackage isn't changed, and no features are changed, dropped or merged on the way in.
+
+**One-time setup** (installs PostgreSQL 18 and PostGIS, then runs the server in the background, also after restarts):
+
+```bash
+brew install postgresql@18 postgis
+```
+
+```bash
+brew services start postgresql@18
+```
+
+**Load or reload** after the pipeline has produced new data (about 2½ minutes, 2.1 GB):
+
+```bash
+python osm_data/load_database.py --data-dir "/Users/zdhoffman/Coding Projects/Skiing App/osm_data/data"
+```
+
+**Open a SQL prompt:**
+
+```bash
+/opt/homebrew/bin/psql skiing
+```
+
+Desktop tools such as QGIS (to see the data on a map) connect to host `localhost`, port `5432`, database `skiing`, with your macOS user name and no password. Homebrew's setup accepts only connections from this Mac, and trusts all of them without a password.
+
+### What's in it
+| Schema | Contents |
+|---|---|
+| `osm` | `points`, `lines`, `multilinestrings`, `multipolygons`, `other_relations`: one table per GeoPackage layer, with the same `fid`s and columns. `load_info` records when it was loaded, the OSM snapshot, row counts and the input file. |
+| `ski` | Views over those tables for common questions (below). |
+
+Differences from the GeoPackage:
+- `other_tags` and `merge_conflicts` are `jsonb`: `other_tags->>'aerialway:capacity'`.
+- `merged_ids` is a text array: `merged_ids @> array['w4271938']` finds the merged feature containing an OSM way. Unmerged rows have no `merged_ids`; find them by `osm_id` (or `osm_way_id`).
+- `natural` is a reserved word in SQL, so quote it: `"natural" = 'wood'`.
+- Geometry is in `geom` (longitude/latitude, EPSG:4326).
+
+| View | Rows | Contents |
+|---|---|---|
+| `ski.runs` | lines whose `piste:type` includes `downhill` | `name`, `difficulty`, `grooming`, `oneway`, `gladed`, `length_m` |
+| `ski.run_areas` | downhill areas | `name`, `difficulty`, `grooming`, `gladed`, `area_m2` |
+| `ski.run_routes` | downhill route relations not merged into their ways; they can overlap `ski.runs` | `name`, `difficulty` |
+| `ski.lifts` | `aerialway` lines that carry skiers: cable car, gondola, mixed, chair, drag, T-bar, J-bar, platter, rope tow, magic carpet. Not stations, zip lines, goods lifts, proposed or abandoned lifts, `yes`/`unknown`, or funiculars. | `name`, `lift_type`, `length_m` |
+| `ski.resorts` | `landuse=winter_sports` areas. Some real resorts have no such outline in OSM. | `name`, `area_m2` |
+
+Every view also has `fid`, `osm_id`, `merged_ids`, `tags` (the `other_tags`) and `geom`.
+
+**Runs aren't assigned to resorts yet.** Join them by location:
+
+```sql
+SELECT run.difficulty, count(*), round(sum(run.length_m) / 1000) AS km
+FROM ski.resorts AS resort
+JOIN ski.runs AS run ON ST_Intersects(resort.geom, run.geom)
+WHERE resort.name = 'Vail'
+GROUP BY run.difficulty;
+```
+
+**Runs within 300 m of a position** (longitude first). Casting to `geography` gives distances in metres and uses an index:
+
+```sql
+SELECT name, difficulty,
+       ST_Distance(geom::geography, ST_Point(-106.3742, 39.6061, 4326)::geography) AS metres
+FROM ski.runs
+WHERE ST_DWithin(geom::geography, ST_Point(-106.3742, 39.6061, 4326)::geography, 300)
+ORDER BY metres;
+```
+
+**Search by name, allowing misspellings:**
+
+```sql
+SELECT name, difficulty FROM ski.runs
+WHERE name % 'Riva Ridg'
+ORDER BY similarity(name, 'Riva Ridg') DESC;
+```
+
+### Reloading
+- **Safe to rerun:** it does nothing if the database already holds this input and this version of the script. `--force` reloads anyway.
+- **All or nothing:** the new data is built in a staging schema (`osm_new`), checked against the GeoPackage row counts, then swapped in at once. If anything fails, the old data stays. A failed load can leave `osm_new` taking up disk space; the next load removes it.
+- **Your own tables belong in another schema.** A reload replaces the `osm` schema and the views above. If something of yours depends on them (a view or a foreign key), the reload stops with an error naming it rather than deleting it; drop it, reload, then recreate it. Don't add your own objects inside `osm`.
+- `fid`s can change when the pipeline is rerun, so don't use them as permanent ids.
+
+Flags: `--data-dir`, `--input` (another GeoPackage), `--dbname` (default `skiing`), `--force`. To use another server, set the usual `PGHOST`, `PGPORT` and `PGUSER` variables.
 
 ## How it works
 1. **Download** (`download_osm.py`):
