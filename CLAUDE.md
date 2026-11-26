@@ -24,7 +24,7 @@ This file must stay accurate. **Before finishing any task that changes the repo,
 - Facts derivable from code (every function name) don't belong here; record what is non-obvious: purpose, decisions, gotchas, how to run things.
 
 ## Status
-- Done: download Geofabrik US + Canada OSM extracts and keep them current; extract downhill runs; extract all features within 10 mi of any run; first cleaning pass (`clean_features.py`) keeping ski and nature features; second pass (`merge_features.py`) merging split features; local PostGIS database of the merged data (`load_database.py`).
+- Done: download Geofabrik US + Canada OSM extracts and keep them current; extract downhill runs; extract all features within 10 mi of any run; first cleaning pass (`clean_features.py`) keeping ski and nature features; second cleaning pass (`merge_features.py`) joining features split across several OSM objects. `ski_nature_merged.gpkg` is the current hand-off dataset for later stages; it is also loaded into a local PostGIS database (`load_database.py`).
 - Not started: run difficulty/rating model, personalization, conditions data, routing, iOS app.
 
 ## Repository layout
@@ -37,10 +37,10 @@ osm_data/                      OSM data pipeline (all Python so far)
   download_osm.py              download/update Geofabrik extracts
   filter_near_runs.py          runs + 10-mile zone + features near runs
   clean_features.py            keep only ski and nature features
-  merge_features.py            merge features split across OSM objects
+  merge_features.py            join features split across several OSM objects
   load_database.py             load the merged data into local PostGIS
-  tests/                       pytest tests (merge rules)
   check_outputs.py             sanity checks on filter output
+  tests/                       pytest suite (merge_features only so far)
   osmconf.ini                  GDAL OSM driver config (project copy)
   data/                        GIT-IGNORED; multi-GB inputs and outputs
 scripts/check_claude_md.sh     Stop-hook helper (CLAUDE.md freshness reminder)
@@ -50,8 +50,7 @@ scripts/check_claude_md.sh     Stop-hook helper (CLAUDE.md freshness reminder)
 ```
 
 ## Environment
-- Python from the `coding-projects` conda env: geopandas, shapely, pyogrio, numpy (plus pyosmium for `pyosmium-up-to-date`).
-- `merge_features.py` also needs pyosmium, scipy and rapidfuzz.
+- Python from the `coding-projects` conda env: geopandas, shapely, pyogrio, numpy, pyosmium (for `pyosmium-up-to-date` and relation member lists), scipy and rapidfuzz (`merge_features.py`), pytest.
 - CLI tools: `osmium-tool` (`brew install osmium-tool`), GDAL (`ogr2ogr`), `curl`.
 - Database: Homebrew `postgresql@18` + `postgis`, running as a `brew services` service on localhost:5432 (trust auth, database `skiing`, data under `/opt/homebrew/var/postgresql@18`). Claude's command sandbox may block the connection.
 - Scripts import `common` directly, so run them as `python osm_data/<script>.py` (script dir is on `sys.path`).
@@ -65,10 +64,11 @@ Data flow:
 Geofabrik us + canada .osm.pbf  --download_osm.py-->  data/raw/
 data/raw  --filter_near_runs.py-->  data/out/{runs.*, zone_10mi.gpkg, near_runs.osm.pbf, features_near_runs.gpkg, manifest.json}
 features_near_runs.gpkg  --clean_features.py-->  data/out/{ski_nature.gpkg, ski_nature.json}
-ski_nature.gpkg  --merge_features.py-->  data/out/{ski_nature_merged.gpkg, ski_nature_merged.json, merge_*.csv, merge_review.html}
+ski_nature.gpkg + near_runs.osm.pbf  --merge_features.py-->  data/out/{ski_nature_merged.gpkg, ski_nature_merged.json, merge_*.csv, merge_review.html}
 ski_nature_merged.gpkg  --load_database.py-->  PostGIS database "skiing" (schemas osm, ski)
-data/out  --check_outputs.py-->  PASS/FAIL report
+data/out  --check_outputs.py-->  PASS/FAIL report (filter outputs only)
 ```
+`osm_id` / `osm_way_id` is the only id that is stable across files; `fid` is a row number within one GeoPackage. `input_snapshot` (the OSM snapshot time) is copied into every manifest.
 
 ### `download_osm.py`
 - Downloads `north-america/us` and `north-america/canada` from Geofabrik, verified against `.md5`, resumable via `.part` files.
@@ -95,7 +95,14 @@ data/out  --check_outputs.py-->  PASS/FAIL report
 - Gotchas: `other_tags` is single-quoted pseudo-JSON (needs SQLite 3.42+ JSON5); the `Layer.tag()` helper does a cheap `LIKE` before `json_extract`. GDAL turns `:` into `_` in column names (`piste:type` -> `piste_type`). `TEXT_KEYS` are excluded from the "tag says ski" rule so street names don't match.
 
 ### `merge_features.py`
-Merges split features (same name + touching). `ski_nature_merged.gpkg` is the hand-off dataset; it adds `merge_group`, `merged_ids`, `merged_count`, `merge_match`, `merge_conflicts`, and its `lines` layer mixes LineStrings and MultiLineStrings. Rules are in `osm_data/README.md`.
+- Reads `ski_nature.gpkg` plus `near_runs.osm.pbf` (relation member lists, which GeoPackages don't keep); neither is modified. Writes `ski_nature_merged.gpkg` (same layers/columns), `ski_nature_merged.json`, and the review outputs `merge_groups.csv` (after), `merge_pieces.csv` (before), `merge_near_misses.csv` (touching pairs not merged, and why) and `merge_review.html`.
+- Merges only when **name + location + kind** all match: normalized names with small misspellings allowed (rapidfuzz OSA distance) but qualifier words (upper/lower, compass points, numbers, roman numerals) must agree; lines meet end-to-end within 15 m, polygons within 5 m; same kind of feature (wood = forest, grass = meadow = grassland, stream/river/flowline together; lifts need the same `aerialway` and meet end to end; side-by-side twin lifts stay apart).
+- Relations: an unnamed way in exactly one named route/waterway relation inherits its name; a relation whose `lines` ways all carry its name is absorbed into them. Waterfalls stay separate.
+- Attributes: hardest `piste:difficulty` wins, multi-value tags are combined, `gladed`/`lit`/`piste:snowmaking` are yes if any piece says yes, other conflicts go to the longest/largest piece. All recorded in `merge_conflicts`.
+- New columns (all layers except `points`): `merge_group` (joins to `merge_groups.csv`), `merged_ids` (`w123;w456;r789`, representative first; the row keeps that piece's `osm_id`), `merged_count`, `merge_match`, `merge_conflicts`. Untouched rows keep their `ski_nature.gpkg` fid.
+- Gotchas: the `lines` layer can now hold MultiLineStrings. Distances and lengths are geodesic (WGS84), not projected. Points and run areas vs run lines are never merged. Self-checks (lengths, areas, row counts, re-matching finds nothing) stop the script before writing if they fail.
+- Rebuilds if an input is newer, a review file is missing, or the rules hash changed (it includes the script's own md5, so any edit to the script triggers a rebuild). Flags: `--data-dir`, `--force`, `--report` (prints what would merge, writes nothing).
+- Tests: `python -m pytest osm_data/tests`.
 
 ### `load_database.py`
 - Loads `ski_nature_merged.gpkg` into PostGIS: schema `osm` (one table per layer, same fids; `load_info`) and views in schema `ski` (`runs`, `run_areas`, `run_routes`, `lifts`, `resorts`). Later stages should query these. View definitions (including which `aerialway` values count as lifts) are `VIEWS`/`LIFT_TYPES` in the script.
@@ -114,10 +121,10 @@ Merges split features (same name + touching). `ski_nature_merged.gpkg` is the ha
 Project copy of GDAL's OSM config: more closed-way polygon keys, ski and land-cover tags promoted to real columns (`piste:*`, `gladed`, `aerialway`, `leaf_type`, `landcover`, `surface`, `ele`, ...). Every layer has `piste_type`. Its md5 is part of the filter settings.
 
 ### `common.py`
-`DEFAULT_DATA_DIR`, `OSMCONF`, logging, `require_tools`, `run` (logs then runs), `tmp_path`/`finish` (write to `tmp_<name>` then rename atomically), `snapshot_time`, JSON helpers, `human_size`.
+`DEFAULT_DATA_DIR`, `OSMCONF`, logging, `require_tools`, `run` (logs then runs), `tmp_path`/`finish` (write to `tmp_<name>` then rename atomically), `snapshot_time`, JSON helpers, `human_size`, plus GeoPackage helpers shared by the cleaning scripts (`connect_ro` opens read-only, `fid_range`, `polygonal`).
 
 ### Output layers
-`points`, `lines`, `multilinestrings`, `multipolygons`, `other_relations`; common tags as columns, the rest in `other_tags`.
+`points`, `lines`, `multilinestrings`, `multipolygons`, `other_relations`; common tags as columns, the rest in `other_tags`. Every GeoPackage in the pipeline uses these five layers.
 
 ## Data-cleaning preferences (from the project owner)
 - **Every cleaning step that changes or merges features must also write a review output** (CSV/HTML) listing OSM identifiers (way/relation ids with openstreetmap.org links, plus map links) before and after, so changes can be verified on the OSM website.
@@ -129,10 +136,10 @@ Project copy of GDAL's OSM config: more closed-way polygon keys, ski and land-co
 - Scripts are re-runnable and idempotent: skip when output is newer than input; write via `tmp_` file then rename; clean intermediates.
 - Docs live next to code: update `osm_data/README.md` whenever behavior, flags or outputs change.
 - Never commit data (`*.osm.pbf`, `osm_data/data/`, indexes) or credentials (`proxyinfo.txt`).
-- `python -m pytest osm_data/tests` covers the merge rules; `check_outputs.py` validates filter output. The database loader has no automated tests.
+- Tests: `python -m pytest osm_data/tests` (merge_features only). `check_outputs.py` validates the filter outputs; cleaning steps are checked by hand through their review files. The database loader has no automated tests.
 
 ## CI and GitHub
 - Default branch on GitHub (`N0DuckingWay/skiing`): `main`; open PRs against it. `ci.yml` runs on pushes to `main` and on PRs, with a size gate for PRs (PRs touching one file and 50 or fewer changed lines, clean merges of `main`, and workflow-only PRs skip).
   - Lint: `ruff check --isolated --select E4,E9,F osm_data/` (syntax errors, import placement, pyflakes). Run the same locally before pushing.
-  - Test: only `python -m compileall -q osm_data`; the pytest suite isn't run in CI yet.
+  - Test: only `python -m compileall -q osm_data`. The pytest suite in `osm_data/tests` is not run in CI yet; run it locally.
 - `claude.yml`: responds to `@claude` mentions on issues and PRs. `claude-code-review.yml`: automated PR review.

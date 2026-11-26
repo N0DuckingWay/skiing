@@ -86,7 +86,7 @@ jobs:
           # A merge git completes by itself, with no conflicts, is a clean one.
           # Its tree must equal the pushed commit's; any difference means the
           # author resolved conflicts or changed code inside the merge.
-          if git merge --no-commit --no-ff "$HEAD_SHA^2" >/main/null 2>&1 \
+          if git merge --no-commit --no-ff "$HEAD_SHA^2" >/dev/null 2>&1 \
              && [ "$(git write-tree)" = "$(git rev-parse "$HEAD_SHA^{tree}")" ]; then
             echo "Clean pull of main; skipping CI"
             echo "run_ci=false" >> "$GITHUB_OUTPUT"
